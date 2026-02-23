@@ -4,30 +4,33 @@ import pandas as pd
 import datetime
 import logging
 
+# 조용하게 실행
 logging.basicConfig(level=logging.WARNING, format="%(message)s")
 
-# --- 설정값 ---
-HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "http://data.krx.co.kr/"}
-
+# --- NXT 종목 조회 (캐시 적용 버전) ---
 def get_nextrade_filtered_symbols(trdDd: str):
     """
-    NXT 종목 가져오기 (로컬 CSV 캐시 우선)
+    NXT 종목 조회: 로컬 CSV가 있으면 읽고, 없으면 웹에서 긁어와서 저장함.
+    trdDd: '20260223' 형태
     """
-    # 1. 캐시 경로 설정 (data/2026/02/20260223.csv)
     year, month = trdDd[:4], trdDd[4:6]
     cache_dir = f"data/{year}/{month}"
     cache_path = f"{cache_dir}/{trdDd}.csv"
 
-    # 로컬에 있으면 바로 읽기
+    # 1. 로컬 캐시 확인
     if os.path.exists(cache_path):
         try:
             df_cached = pd.read_csv(cache_path, dtype={'단축코드': str})
             return "Local Cache", df_cached
         except:
-            pass
+            pass # 에러 나면 그냥 새로 받음
 
-    # 없으면 공식 사이트 호출
+    # 2. 웹에서 데이터 수집 (기존 get_nextrade_filtered_symbols 로직)
     url = "https://www.nextrade.co.kr/brdinfoTime/brdinfoTimeList.do"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.nextrade.co.kr/menu/transactionStatusMain/menuList.do",
+    }
     payload = {
         "_search": "false",
         "nd": str(int(pd.Timestamp.now().timestamp() * 1000)),
@@ -37,36 +40,40 @@ def get_nextrade_filtered_symbols(trdDd: str):
     }
 
     try:
-        resp = requests.post(url, headers=HEADERS, data=payload, verify=False, timeout=15)
+        resp = requests.post(url, headers=headers, data=payload, verify=False, timeout=15)
         js = resp.json()
         items = js.get("brdinfoTimeList", [])
-        if not items: return "N/A", pd.DataFrame()
+        if not items:
+            return "N/A", pd.DataFrame()
 
+        # 데이터 프레임 변환
         df = pd.DataFrame(items)
-        # 필요한 컬럼만 정리
         df = df[['mktNm', 'isuCd', 'isuSrdCd', 'isuAbwdNm', 'trdIpsbRsn']].copy()
         df.columns = ["시장구분", "표준코드", "단축코드", "종목명", "거래불가사유"]
-        df["단축코드"] = df["단축코드"].str[1:] # 맨 앞 영문자 제거
+        df["단축코드"] = df["단축코드"].str[1:] # 앞자리 문자 제거
 
-        # 캐시 저장
+        # 3. 성공 시 캐시 저장
         os.makedirs(cache_dir, exist_ok=True)
         df.to_csv(cache_path, index=False, encoding="utf-8-sig")
         
         return js.get("setTime", "N/A"), df
-    except:
-        return "N/A", pd.DataFrame(columns=["종목명"])
+    except Exception as e:
+        return "N/A", pd.DataFrame()
 
-# --- KIND 데이터 수집 (기존 fnc2 로직) ---
+# --- 아래는 기존 fnc2.py에 있던 엔진 함수들 그대로 복사 ---
+
 def kind_fetch(arg, f, t, page_size=100):
-    # 실제 구현 시 여기에 기존 kind_fetch(cat기반) 로직을 넣으세요.
-    # 현재는 구조를 위해 빈 프레임 반환 예시만 둠
-    return pd.DataFrame()
+    # (여기에 기존 kind_fetch 로직 전체 복사)
+    pass
 
 def fetch_investor_warning(f, t, page_size=100):
-    return pd.DataFrame()
+    # (여기에 기존 fetch_investor_warning 로직 전체 복사)
+    pass
 
 def fetch_shortterm_overheat(f, t, page_size=100):
-    return pd.DataFrame()
+    # (여기에 기존 fetch_shortterm_overheat 로직 전체 복사)
+    pass
 
 def fetch_market_watch(f, t, page_size=100):
-    return pd.DataFrame()
+    # (여기에 기존 fetch_market_watch 로직 전체 복사)
+    pass
