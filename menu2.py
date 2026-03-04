@@ -1,5 +1,4 @@
 # menu2.py
-import ipaddress
 from __future__ import annotations
 
 import streamlit as st
@@ -337,59 +336,7 @@ def run():
     </style>
     """, unsafe_allow_html=True)
 
-st.markdown("### 📡 KRX • NXT 공시 모니터")
-
-# ─────────────────────────────────────────
-# ✅ 접속 IP 표시 + 192.168.40.0/24만 허용
-# ─────────────────────────────────────────
-client_ip = st.context.ip_address  # str | None
-
-# 작은 글씨로 IP 표시
-st.caption(f"접속 IP: {client_ip or '알 수 없음'}")
-
-allowed_net = ipaddress.ip_network("192.168.40.0/24")
-
-def _is_allowed(ip_str: str | None) -> bool:
-    if not ip_str:
-        return False
-    try:
-        ip = ipaddress.ip_address(ip_str)
-    except ValueError:
-        return False
-    return ip in allowed_net
-
-if not _is_allowed(client_ip):
-    # 화이트 스크린 스타일 + 최소 안내만 표시
-    st.markdown(
-        """
-        <style>
-        /* 전체 배경 흰색 */
-        .stApp { background: #ffffff !important; }
-
-        /* 사이드바/헤더/푸터 숨김 */
-        [data-testid="stSidebar"] { display: none !important; }
-        header { display: none !important; }
-        footer { display: none !important; }
-
-        /* 중앙 정렬 */
-        .block-container {
-            padding-top: 20vh !important;
-            max-width: 900px !important;
-        }
-        </style>
-
-        <div style="text-align:center;">
-          <div style="font-size:20px; font-weight:700; margin-bottom:10px;">
-            허용 IP만 접속 가능
-          </div>
-          <div style="font-size:14px; color:#666;">
-            현재 접속 IP가 허용 대역(192.168.40.xxx)이 아닙니다.
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.stop()
+    st.markdown("### 📡 KRX • NXT 공시 모니터")
 
     if "menu_cache" not in st.session_state:
         st.session_state["menu_cache"] = {}
@@ -401,7 +348,7 @@ if not _is_allowed(client_ip):
         # 1) 📆 기간
         st.markdown("## 📆 KIND 조회 기간")
         today_kst = datetime.datetime.now(ZoneInfo("Asia/Seoul")).date()
-        three_weeks_ago = today_kst - datetime.timedelta(days=10) # 5일로 변경
+        three_weeks_ago = today_kst - datetime.timedelta(days=5) # 5일로 변경
 
         c1, c2 = st.columns(2)
         with c1:
