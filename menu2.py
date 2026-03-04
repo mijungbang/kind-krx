@@ -348,7 +348,7 @@ def run():
         # 1) 📆 기간
         st.markdown("## 📆 KIND 조회 기간")
         today_kst = datetime.datetime.now(ZoneInfo("Asia/Seoul")).date()
-        three_weeks_ago = today_kst - datetime.timedelta(days=21)
+        three_weeks_ago = today_kst - datetime.timedelta(days=10) # 5일로 변경
 
         c1, c2 = st.columns(2)
         with c1:
