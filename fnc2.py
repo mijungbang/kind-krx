@@ -29,20 +29,21 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 )
 
+# 카테고리 코드 (세부검색 disTypevalue)
 CODE_MAP: Dict[str, str] = {
-    "halt":  "0311",
-    "mgmt":  "0350",
-    "alert": "0356",
-    "misc":  "0305",
+    "halt":  "0311",  # 거래정지/재개
+    "mgmt":  "0350",  # 관리종목
+    "alert": "0356",  # 투자주의·환기
+    "misc":  "0305",  # 기타 시장안내
 }
 
 KIND_URL = "https://kind.krx.co.kr/disclosure/details.do"
-
 
 # ─────────────────────────────────────────────────────────────
 # 유틸
 # ─────────────────────────────────────────────────────────────
 def _date_to_str(d: str | pd.Timestamp) -> str:
+    """'YYYY-MM-DD' 또는 'YYYYMMDD' 또는 pandas.Timestamp → 'YYYY-MM-DD'"""
     if isinstance(d, pd.Timestamp):
         return d.strftime("%Y-%m-%d")
     s = str(d)
@@ -52,6 +53,9 @@ def _date_to_str(d: str | pd.Timestamp) -> str:
 
 
 def _extract_company_cell(company_td) -> Tuple[str, List[str], str, str]:
+    """
+    회사명 셀에서 시장/플래그/회사명/종목코드 추출
+    """
     market = ""
     flags: List[str] = []
 
@@ -82,6 +86,10 @@ def _extract_company_cell(company_td) -> Tuple[str, List[str], str, str]:
 
 
 def _parse_rows_html(html: str) -> List[List[str]]:
+    """
+    상세검색 테이블 파싱 → 행 배열
+    반환: [번호, 시간, 시장, 플래그, 회사명, 종목코드, 공시제목, 문서번호, 뷰어URL, 제출인]
+    """
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table", class_="list type-00 mt10")
     if not table or not table.tbody:
@@ -115,15 +123,13 @@ def _parse_rows_html(html: str) -> List[List[str]]:
         viewer = f"{VIEWER_BASE.format(docno=docno)}#{title}" if docno else ""
         submitter = tds[4].get_text(strip=True)
 
-        out.append([
-            no, ts, market, ",".join(flags), company_name, code_num,
-            title, docno, viewer, submitter
-        ])
+        out.append([no, ts, market, ",".join(flags), company_name, code_num, title, docno, viewer, submitter])
 
     return out
 
 
 def _make_df(rows: List[List[str]]) -> pd.DataFrame:
+    """rows → DF, 문서번호 중복 제거 + 시간 내림차순 + 스팩 제외"""
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(
@@ -142,8 +148,8 @@ def _make_df(rows: List[List[str]]) -> pd.DataFrame:
 
 
 def _looks_like_valid_kind_table(html: str) -> bool:
-    # KIND 정상 응답이면 보통 이 테이블이 존재
-    return 'table class="list type-00 mt10"' in html or "list type-00 mt10" in html
+    # 정상 응답이면 보통 아래 테이블이 존재
+    return ('table class="list type-00 mt10"' in html) or ("list type-00 mt10" in html)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -163,6 +169,11 @@ def _kind_disclosure_search(
     report_nm: Optional[str] = None,
     report_cd: Optional[str] = None,
 ) -> pd.DataFrame:
+    """
+    KIND 상세검색(카테고리) 페이지네이션 수집.
+    반환 컬럼:
+    [페이지, 번호, 시간, 시장, 플래그, 회사명, 종목코드, 공시제목, 문서번호, 뷰어URL, 제출인]
+    """
     BASE = "https://kind.krx.co.kr"
     GET_URL = f"{BASE}/disclosure/details.do"
     POST_URL = f"{BASE}/disclosure/details.do"
@@ -198,6 +209,7 @@ def _kind_disclosure_search(
         "reportNmPop": report_nm or "",
         "reportCd": (str(report_cd) if report_cd is not None else ""),
 
+        # 나머지 공란(원형 유지)
         "disclosureType01": "","disclosureType03": "","disclosureType04": "","disclosureType05": "",
         "disclosureType06": "","disclosureType07": "","disclosureType08": "","disclosureType09": "",
         "disclosureType10": "","disclosureType11": "","disclosureType13": "","disclosureType14": "",
@@ -221,8 +233,6 @@ def _kind_disclosure_search(
 
     try:
         s.headers.update(base_headers)
-
-        # warm-up
         s.get(GET_URL, params=warm_params, timeout=timeout, verify=verify_ssl)
 
         for page in range(1, max_pages + 1):
@@ -232,7 +242,7 @@ def _kind_disclosure_search(
             r.encoding = r.apparent_encoding
             html = r.text
 
-            # ✅ 차단/오류 페이지(200 OK 포함) 감지 → 예외로 캐싱 방지
+            # ✅ 200 OK 차단/오류 HTML도 여기서 걸러서 "캐싱"을 방지
             if not _looks_like_valid_kind_table(html):
                 snippet = re.sub(r"\s+", " ", html)[:300]
                 raise RuntimeError(f"KIND 응답이 정상 테이블이 아님(차단/오류 가능). 응답 일부: {snippet}")
@@ -268,6 +278,7 @@ def kind_fetch(
     report_nm: Optional[str] = None,
     report_cd: Optional[str] = None,
 ) -> pd.DataFrame:
+    """cat 기반(기존): halt/mgmt/alert/misc"""
     code = CODE_MAP[category]
     df = _kind_disclosure_search(
         from_date, to_date, code,
@@ -322,12 +333,62 @@ TARGETS_WARN: List[Tuple[str,str,str,str]] = [
     ("투자위험종목지정",         "68812", "투자위험종목지정",                "투자위험종목지정"),
     ("투자위험종목지정",         "70832", "투자위험종목지정",                "투자위험종목지정"),
     ("투자위험종목지정해제",     "68813", "투자위험종목지정해제",            "투자위험종목지정해제"),
-    ("투자위험종목지정해제",     "70834", "투자위험종목지정해제",            "투자위험종목 지정해제"),
+    ("투자위험종목지정해제",     "70834", "투자위험종목지정해제",            "투자위험종목지정해제"),
 ]
 
+# ✅ "시장감시위원회" 메뉴에서 보여줄 reportCd 세트 (사용자 제공)
 TARGETS_MARKET_WATCH: List[Tuple[str,str,str,str]] = [
-    # ... (너가 준 리스트 그대로 두면 됨)
+    # [유가증권]
+    ("기타시장안내(단기과열완화장치발동예고)", "99432",
+     "기타시장안내 (단기과열완화장치 발동예고)", "기타시장안내 (단기과열완화장치 발동예고)"),
+    ("단기과열완화장치발동(매매거래정지및단일가매매적용)", "99431",
+     "단기과열완화장치 발동(매매거래정지 및 단일가매매 적용)", "단기과열완화장치 발동(매매거래정지 및 단일가매매 적용)"),
+    ("매매거래정지및재개(투자경고종목지정중)", "68818",
+     "매매거래 정지 및 재개(투자경고종목 지정중)", "매매거래 정지 및 재개(투자경고종목 지정중)"),
+    ("매매거래정지및재개(투자위험종목지정중)", "68815",
+     "매매거래 정지 및 재개(투자위험종목 지정중)", "매매거래 정지 및 재개(투자위험종목 지정중)"),
+    ("매매거래정지및재개(투자위험종목최초지정)", "68819",
+     "매매거래 정지 및 재개(투자위험종목 최초지정)", "매매거래 정지 및 재개(투자위험종목 최초지정)"),
+    ("매매거래정지및신규호가접수중지안내", "99306",
+     "매매거래정지 및 신규호가접수중지 안내", "매매거래정지 및 신규호가접수중지 안내"),
+    ("장애종목매매거래정지시장안내(유가증권시장)", "99457",
+     "장애종목 매매거래정지 시장안내 (유가증권시장)", "장애종목 매매거래정지 시장안내 (유가증권시장)"),
+    ("장애종목매매거래재개시장안내(유가증권시장/접속매매방식재개)", "99458",
+     "장애종목 매매거래재개 시장안내 (유가증권시장 / 접속매매 방식 재개)", "장애종목 매매거래재개 시장안내 (유가증권시장 / 접속매매 방식 재개)"),
+    ("장애종목매매거래재개시장안내(유가증권시장/종가단일가매매방식재개)", "99459",
+     "장애종목 매매거래재개 시장안내 (유가증권시장 / 종가단일가매매 방식 재개)", "장애종목 매매거래재개 시장안내 (유가증권시장 / 종가단일가매매 방식 재개)"),
+    ("장애종목매매거래재개시장안내(유가증권시장/시간외단일가매매방식재개)", "99462",
+     "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외단일가매매 방식 재개)", "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외단일가매매 방식 재개)"),
+    ("장애종목매매거래재개시장안내(유가증권시장/시간외종가매매방식재개)", "99461",
+     "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외종가매매 방식 재개)", "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외종가매매 방식 재개)"),
+    ("장애종목매매거래재개시장안내(유가증권시장/시간외종가매매호가접수시간대재개)", "99460",
+     "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외종가매매 호가접수시간대 재개)", "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외종가매매 호가접수시간대 재개)"),
+
+    # [코스닥]
+    ("기타시장안내(단기과열완화장치발동예고)", "70729",
+     "기타시장안내 (단기과열완화장치 발동예고)", "기타시장안내 (단기과열완화장치 발동예고)"),
+    ("단기과열완화장치발동(매매거래정지및단일가매매적용)", "70728",
+     "단기과열완화장치 발동(매매거래정지 및 단일가매매 적용)", "단기과열완화장치 발동(매매거래정지 및 단일가매매 적용)"),
+    ("매매거래정지및재개(투자경고종목지정중)", "70837",
+     "매매거래 정지 및 재개(투자경고종목 지정중)", "매매거래 정지 및 재개(투자경고종목 지정중)"),
+    ("매매거래정지및재개(투자위험종목지정중)", "70836",
+     "매매거래 정지 및 재개(투자위험종목 지정중)", "매매거래 정지 및 재개(투자위험종목 지정중)"),
+    ("매매거래정지및재개(투자위험종목최초지정)", "70838",
+     "매매거래 정지 및 재개(투자위험종목 최초지정)", "매매거래 정지 및 재개(투자위험종목 최초지정)"),
+    ("장애종목매매거래정지시장안내(코스닥시장)", "72116",
+     "장애종목 매매거래정지 시장안내 (코스닥시장)", "장애종목 매매거래정지 시장안내 (코스닥시장)"),
+    ("장애종목매매거래재개시장안내(코스닥시장/접속매매방식재개)", "72117",
+     "장애종목 매매거래재개 시장안내 (코스닥시장 / 접속매매 방식 재개)", "장애종목 매매거래재개 시장안내 (코스닥시장 / 접속매매 방식 재개)"),
+    ("장애종목매매거래재개시장안내(코스닥시장/종가단일가매매방식재개)", "72118",
+     "장애종목 매매거래재개 시장안내 (코스닥시장 / 종가단일가매매 방식 재개)", "장애종목 매매거래재개 시장안내 (코스닥시장 / 종가단일가매매 방식 재개)"),
+    ("장애종목매매거래재개시장안내(코스닥시장/시간외단일가매매방식재개)", "72121",
+     "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외단일가매매 방식 재개)", "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외단일가매매 방식 재개)"),
+    ("장애종목매매거래재개시장안내(코스닥시장/시간외종가매매방식재개)", "72120",
+     "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외종가매매 방식 재개)", "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외종가매매 방식 재개)"),
+    ("장애종목매매거래재개시장안내(코스닥시장/시간외종가매매호가접수시간대재개)", "72119",
+     "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외종가매매 호가접수시간대 재개)", "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외종가매매 호가접수시간대 재개)"),
 ]
+
 
 def _fetch_reportcd_with_warn_payload(
     from_date: str,
@@ -362,7 +423,7 @@ def _fetch_reportcd_with_warn_payload(
                 r.raise_for_status()
                 html = r.text
 
-                # ✅ 여기서도 비정상 응답 감지
+                # ✅ 200 OK 차단/오류 HTML도 여기서 걸러서 "캐싱"을 방지
                 if not _looks_like_valid_kind_table(html):
                     snippet = re.sub(r"\s+", " ", html)[:300]
                     raise RuntimeError(f"KIND(warn payload) 응답이 정상 테이블이 아님(차단/오류 가능). 응답 일부: {snippet}")
@@ -387,6 +448,7 @@ def fetch_investor_warning(
     max_pages: int = 1000,
     sleep: float = 0.15,
 ) -> pd.DataFrame:
+    """투자경고·위험: 여러 reportCd × 페이지네이션 전체 수집 → 문서번호 중복 제거."""
     return _fetch_reportcd_with_warn_payload(
         from_date, to_date, TARGETS_WARN,
         page_size=page_size, max_pages=max_pages, sleep=sleep
@@ -401,6 +463,7 @@ def fetch_shortterm_overheat(
     max_pages: int = 1000,
     sleep: float = 0.15,
 ) -> pd.DataFrame:
+    """단기과열: reportNm='단기과열' 단일 조건 페이지네이션 수집."""
     f = _date_to_str(from_date)
     t = _date_to_str(to_date)
 
@@ -448,6 +511,7 @@ def fetch_market_watch(
     max_pages: int = 1000,
     sleep: float = 0.15,
 ) -> pd.DataFrame:
+    """시장감시위원회(사용자 지정): 사용자가 준 reportCd 목록을 warn 페이로드 방식으로 조회."""
     return _fetch_reportcd_with_warn_payload(
         from_date, to_date, TARGETS_MARKET_WATCH,
         page_size=page_size, max_pages=max_pages, sleep=sleep
