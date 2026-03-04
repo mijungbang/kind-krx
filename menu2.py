@@ -1,10 +1,10 @@
 # menu2.py
-import ipaddress
 from __future__ import annotations
 
 import streamlit as st
 import pandas as pd
 import datetime, json, re
+import ipaddress
 from zoneinfo import ZoneInfo
 from streamlit.components.v1 import html
 from html import escape
@@ -307,6 +307,51 @@ def _fetch_multi(f: str, t: str, page_size: int = 100, nonce: int = 0) -> pd.Dat
     return merged.reset_index(drop=True)
 
 # ─────────────────────────────────────────────────────────────
+# ✅ IP 제한 유틸
+# ─────────────────────────────────────────────────────────────
+_ALLOWED_NET = ipaddress.ip_network("192.168.40.0/24")
+
+def _is_allowed_ip(ip_str: str | None) -> bool:
+    if not ip_str:
+        return False
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return ip in _ALLOWED_NET
+
+def _render_white_block_screen(client_ip: str | None):
+    st.markdown(
+        """
+        <style>
+        .stApp { background: #ffffff !important; }
+        [data-testid="stSidebar"] { display: none !important; }
+        header { display: none !important; }
+        footer { display: none !important; }
+        .block-container {
+            padding-top: 22vh !important;
+            max-width: 900px !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"""
+        <div style="text-align:center;">
+          <div style="font-size:20px; font-weight:700; margin-bottom:10px;">
+            허용 IP만 접속 가능
+          </div>
+          <div style="font-size:14px; color:#666; line-height:1.6;">
+            현재 접속 IP가 허용 대역(192.168.40.xxx)이 아닙니다.<br>
+            접속 IP: <b>{escape(client_ip or "알 수 없음")}</b>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# ─────────────────────────────────────────────────────────────
 # App
 # ─────────────────────────────────────────────────────────────
 def run():
@@ -337,59 +382,16 @@ def run():
     </style>
     """, unsafe_allow_html=True)
 
-st.markdown("### 📡 KRX • NXT 공시 모니터")
+    st.markdown("### 📡 KRX • NXT 공시 모니터")
 
-# ─────────────────────────────────────────
-# ✅ 접속 IP 표시 + 192.168.40.0/24만 허용
-# ─────────────────────────────────────────
-client_ip = st.context.ip_address  # str | None
+    # ✅ 접속 IP 출력 (작은 글씨)
+    client_ip = st.context.ip_address  # str | None
+    st.caption(f"접속 IP: {client_ip or '알 수 없음'}")
 
-# 작은 글씨로 IP 표시
-st.caption(f"접속 IP: {client_ip or '알 수 없음'}")
-
-allowed_net = ipaddress.ip_network("192.168.40.0/24")
-
-def _is_allowed(ip_str: str | None) -> bool:
-    if not ip_str:
-        return False
-    try:
-        ip = ipaddress.ip_address(ip_str)
-    except ValueError:
-        return False
-    return ip in allowed_net
-
-if not _is_allowed(client_ip):
-    # 화이트 스크린 스타일 + 최소 안내만 표시
-    st.markdown(
-        """
-        <style>
-        /* 전체 배경 흰색 */
-        .stApp { background: #ffffff !important; }
-
-        /* 사이드바/헤더/푸터 숨김 */
-        [data-testid="stSidebar"] { display: none !important; }
-        header { display: none !important; }
-        footer { display: none !important; }
-
-        /* 중앙 정렬 */
-        .block-container {
-            padding-top: 20vh !important;
-            max-width: 900px !important;
-        }
-        </style>
-
-        <div style="text-align:center;">
-          <div style="font-size:20px; font-weight:700; margin-bottom:10px;">
-            허용 IP만 접속 가능
-          </div>
-          <div style="font-size:14px; color:#666;">
-            현재 접속 IP가 허용 대역(192.168.40.xxx)이 아닙니다.
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.stop()
+    # ✅ IP 제한: 192.168.40.xxx만 허용
+    if not _is_allowed_ip(client_ip):
+        _render_white_block_screen(client_ip)
+        st.stop()
 
     if "menu_cache" not in st.session_state:
         st.session_state["menu_cache"] = {}
@@ -401,7 +403,7 @@ if not _is_allowed(client_ip):
         # 1) 📆 기간
         st.markdown("## 📆 KIND 조회 기간")
         today_kst = datetime.datetime.now(ZoneInfo("Asia/Seoul")).date()
-        three_weeks_ago = today_kst - datetime.timedelta(days=10) # 5일로 변경
+        three_weeks_ago = today_kst - datetime.timedelta(days=10)  # 10일
 
         c1, c2 = st.columns(2)
         with c1:
@@ -462,7 +464,7 @@ if not _is_allowed(client_ip):
                 key="end_time_lbl",
                 label_visibility="collapsed",
             )
-            
+
         # ✅ 단기과열 (예고) 제외 토글들
         exclude_forecast_main = False
         if menu_key == "overheat":
@@ -471,8 +473,6 @@ if not _is_allowed(client_ip):
                 value=True,
                 help="체크 시 '(예고)'로 시작하는 공시는 숨깁니다.",
             )
-        else:
-            exclude_forecast_main = False
 
         exclude_forecast_multi = False
         if menu_key == "multi":
@@ -481,9 +481,7 @@ if not _is_allowed(client_ip):
                 value=True,
                 help="체크 시 모아보기 결과 중 단기과열 공시에서만 '(예고)'로 시작하는 건 제외합니다.",
             )
-        else:
-            exclude_forecast_multi = False
-            
+
         # 5) 조회/캐시 제어 버튼들
         go = st.button("공시 조회", type="primary", use_container_width=True)
 
@@ -499,8 +497,6 @@ if not _is_allowed(client_ip):
                 st.session_state.clear()
                 st.toast("캐시/세션을 초기화했습니다.", icon="🧹")
                 st.rerun()
-
-
 
     if d_start > d_end:
         st.error("시작일이 종료일보다 이후입니다.")
