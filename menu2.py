@@ -337,7 +337,6 @@ def run():
     """, unsafe_allow_html=True)
 
     st.markdown("### 📡 KRX • NXT 공시 모니터")
-    st.markdown("고장 시: http://192.168.40.102:8501/")
 
     if "menu_cache" not in st.session_state:
         st.session_state["menu_cache"] = {}
@@ -410,23 +409,7 @@ def run():
                 key="end_time_lbl",
                 label_visibility="collapsed",
             )
-
-        # 5) 조회/캐시 제어 버튼들
-        go = st.button("공시 조회", type="primary", use_container_width=True)
-
-        cA, cB = st.columns(2)
-        with cA:
-            if st.button("🔄 강제 새로조회", use_container_width=True):
-                st.session_state["force_nonce"] += 1
-                st.toast("캐시 무시하고 다시 조회합니다.", icon="🔄")
-        with cB:
-            if st.button("🧹 초기화", use_container_width=True):
-                st.cache_data.clear()
-                st.cache_resource.clear()
-                st.session_state.clear()
-                st.toast("캐시/세션을 초기화했습니다.", icon="🧹")
-                st.rerun()
-
+            
         # ✅ 단기과열 (예고) 제외 토글들
         exclude_forecast_main = False
         if menu_key == "overheat":
@@ -447,6 +430,24 @@ def run():
             )
         else:
             exclude_forecast_multi = False
+            
+        # 5) 조회/캐시 제어 버튼들
+        go = st.button("공시 조회", type="primary", use_container_width=True)
+
+        cA, cB = st.columns(2)
+        with cA:
+            if st.button("🔄 강제 새로조회", use_container_width=True):
+                st.session_state["force_nonce"] += 1
+                st.toast("캐시 무시하고 다시 조회합니다.", icon="🔄")
+        with cB:
+            if st.button("🧹 초기화", use_container_width=True):
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.session_state.clear()
+                st.toast("캐시/세션을 초기화했습니다.", icon="🧹")
+                st.rerun()
+
+
 
     if d_start > d_end:
         st.error("시작일이 종료일보다 이후입니다.")
