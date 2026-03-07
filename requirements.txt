@@ -4,6 +4,6 @@ pandas>=2.2.2
 requests>=2.31.0
 beautifulsoup4>=4.12.3
 urllib3>=2.2.1
-streamlit_tree_select 
+streamlit-tree-select
 lxml
 ipaddress
