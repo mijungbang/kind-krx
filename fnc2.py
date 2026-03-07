@@ -162,7 +162,7 @@ def _kind_disclosure_search(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 0.3,
+    sleep: float = 1,
     timeout: int = 60,
     verify_ssl: bool = False,
     session: Optional[requests.Session] = None,
@@ -233,11 +233,11 @@ def _kind_disclosure_search(
 
     try:
         s.headers.update(base_headers)
-        s.get(GET_URL, params=warm_params, timeout=timeout, verify=verify_ssl)
+        s.get(GET_URL, params=warm_params, timeout=timeout, verify=False)
 
         for page in range(1, max_pages + 1):
             data["pageIndex"] = str(page)
-            r = s.post(POST_URL, data=data, headers=ajax_headers, timeout=timeout, verify=verify_ssl)
+            r = s.post(POST_URL, data=data, headers=ajax_headers, timeout=timeout, verify=False)
             r.raise_for_status()
             r.encoding = r.apparent_encoding
             html = r.text
@@ -397,7 +397,7 @@ def _fetch_reportcd_with_warn_payload(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 0.15,
+    sleep: float = 1,
 ) -> pd.DataFrame:
     f = _date_to_str(from_date)
     t = _date_to_str(to_date)
@@ -446,7 +446,7 @@ def fetch_investor_warning(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 0.15,
+    sleep: float = 1,
 ) -> pd.DataFrame:
     """투자경고·위험: 여러 reportCd × 페이지네이션 전체 수집 → 문서번호 중복 제거."""
     return _fetch_reportcd_with_warn_payload(
@@ -461,7 +461,7 @@ def fetch_shortterm_overheat(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 0.15,
+    sleep: float = 1,
 ) -> pd.DataFrame:
     """단기과열: reportNm='단기과열' 단일 조건 페이지네이션 수집."""
     f = _date_to_str(from_date)
