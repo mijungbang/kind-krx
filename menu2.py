@@ -383,10 +383,10 @@ def run():
 
         # 4) ⏱ 조회 시간
         TIME_START = [("00:00", datetime.time(0, 0)),
-                      ("14:28", datetime.time(0, 0)),
+                      ("14:28", datetime.time(14, 28)),
                       ("14:30", datetime.time(14, 30))]
         TIME_END   = [("09:00", datetime.time(9, 0)),
-                      ("14:31", datetime.time(9, 0)),
+                      ("14:31", datetime.time(14, 31)),
                       ("23:59", datetime.time(23, 59))]
 
         start_labels = [lbl for lbl, _ in TIME_START]
