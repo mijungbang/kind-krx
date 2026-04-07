@@ -162,8 +162,8 @@ def _kind_disclosure_search(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 1,
-    timeout: int = 60,
+    sleep: float = 5,
+    timeout: int = 120,
     verify_ssl: bool = False,
     session: Optional[requests.Session] = None,
     report_nm: Optional[str] = None,
@@ -397,7 +397,7 @@ def _fetch_reportcd_with_warn_payload(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 1,
+    sleep: float = 3,
 ) -> pd.DataFrame:
     f = _date_to_str(from_date)
     t = _date_to_str(to_date)
@@ -461,7 +461,7 @@ def fetch_shortterm_overheat(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 1,
+    sleep: float = 3,
 ) -> pd.DataFrame:
     """단기과열: reportNm='단기과열' 단일 조건 페이지네이션 수집."""
     f = _date_to_str(from_date)
@@ -509,7 +509,7 @@ def fetch_market_watch(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 0.15,
+    sleep: float = 3,
 ) -> pd.DataFrame:
     """시장감시위원회(사용자 지정): 사용자가 준 reportCd 목록을 warn 페이로드 방식으로 조회."""
     return _fetch_reportcd_with_warn_payload(
