@@ -1,4 +1,5 @@
 # fnc2.py
+# 상장폐지 추가
 from __future__ import annotations
 
 import re
@@ -15,6 +16,7 @@ __all__ = [
     "fetch_investor_warning",
     "fetch_shortterm_overheat",
     "fetch_market_watch",
+    "fetch_delist",
 ]
 
 # ─────────────────────────────────────────────────────────────
@@ -389,6 +391,14 @@ TARGETS_MARKET_WATCH: List[Tuple[str,str,str,str]] = [
      "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외종가매매 호가접수시간대 재개)", "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외종가매매 호가접수시간대 재개)"),
 ]
 
+# ─────────────────────────────────────────────────────────────
+# ✅ 상장폐지 reportCd 세트 (유가증권 68051 / 코스닥 70769)
+# ─────────────────────────────────────────────────────────────
+TARGETS_DELIST: List[Tuple[str,str,str,str]] = [
+    ("상장폐지", "68051", "상장폐지", "상장폐지"),   # 유가증권
+    ("상장폐지", "70769", "상장폐지", "상장폐지"),   # 코스닥
+]
+
 
 def _fetch_reportcd_with_warn_payload(
     from_date: str,
@@ -514,5 +524,20 @@ def fetch_market_watch(
     """시장감시위원회(사용자 지정): 사용자가 준 reportCd 목록을 warn 페이로드 방식으로 조회."""
     return _fetch_reportcd_with_warn_payload(
         from_date, to_date, TARGETS_MARKET_WATCH,
+        page_size=page_size, max_pages=max_pages, sleep=sleep
+    )
+
+
+def fetch_delist(
+    from_date: str,
+    to_date: str,
+    *,
+    page_size: int = 100,
+    max_pages: int = 1000,
+    sleep: float = 3,
+) -> pd.DataFrame:
+    """상장폐지: 유가증권(68051) + 코스닥(70769) reportCd를 warn 페이로드 방식으로 조회."""
+    return _fetch_reportcd_with_warn_payload(
+        from_date, to_date, TARGETS_DELIST,
         page_size=page_size, max_pages=max_pages, sleep=sleep
     )
