@@ -1,5 +1,5 @@
 # menu2.py
-# 상장폐지 추가
+# 상장폐지 추가, 종목코드 매핑 전환
 from __future__ import annotations
 
 import streamlit as st
@@ -43,7 +43,7 @@ MENU_SPEC = [
     ("inv",      "4️⃣ 투자경고·위험 종목", 1),
     ("overheat", "5️⃣ 단기과열 종목",    1),
     ("misc",     "6️⃣ 기타 시장안내",    1),
-    ("delist",   "⚠️ 상장폐지 등",        1),
+    ("delist",   "⚠️ 상장폐지",        1),
 ]
 
 # 실제 동작 맵
@@ -92,11 +92,11 @@ def style_today_rows(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         return [highlight]*len(row) if row.get("당일", "") == "🟡" else [""]*len(row)
     return df.style.apply(_row_style, axis=1)
 
-# KRX 전체에서 NXT 종목만 하이라이트
-def style_nxt_rows(df: pd.DataFrame, nxt_set: set) -> pd.io.formats.style.Styler:
+# KRX 전체에서 NXT 종목만 하이라이트 (종목코드 기준)
+def style_nxt_rows(df: pd.DataFrame, nxt_codes: set) -> pd.io.formats.style.Styler:
     highlight = "background-color: #fff4b6; font-weight: 600;"
     def _row_style(row: pd.Series):
-        return [highlight]*len(row) if str(row.get("종목명", "")) in nxt_set else [""]*len(row)
+        return [highlight]*len(row) if str(row.get("종목코드", "")) in nxt_codes else [""]*len(row)
     return df.style.apply(_row_style, axis=1)
 
 # 화면 표시용 변환 (시간 포맷: yy/mm/dd HH:MM)
@@ -109,6 +109,7 @@ def build_display_df(df: pd.DataFrame, ref_date: datetime.date) -> pd.DataFrame:
             "당일": is_today.map(lambda x: "🟡" if x else ""),
             "시간": time_disp,
             "종목명": df.get("회사명", "").astype(str),
+            "종목코드": df.get("종목코드", "").astype(str),
             "공시제목": df.get("뷰어URL", "").astype(str),
         })
         .sort_values("시간", ascending=False)
@@ -548,17 +549,23 @@ def run():
     ref_date = _last_weekday(d_end)
     df_all_show = build_display_df(df_view, ref_date)
 
-    # NXT 종목셋 & 거래불가사유 매핑
+    # NXT 종목셋 & 거래불가사유 매핑 (종목코드 기준)
     nxt_ref_date = _last_weekday(d_end)
     ymd = nxt_ref_date.strftime("%Y%m%d")
     try:
         _trade_date, nxt_df = get_nextrade_filtered_symbols(ymd)
         if nxt_df is None or nxt_df.empty:
-            nxt_names = set()
+            nxt_codes = set()
             reason_map = {}
         else:
             nxt_df = nxt_df.copy()
             nxt_df["종목명"] = nxt_df["종목명"].astype(str)
+
+            # NXT 종목코드: A005680 (7자리) → [1:-1] → 00568 (5자리, KIND 크롤링과 동일)
+            if "종목코드" in nxt_df.columns:
+                nxt_df["_code5"] = nxt_df["종목코드"].astype(str).str[1:-1]
+            else:
+                nxt_df["_code5"] = ""
 
             if "거래불가사유" not in nxt_df.columns:
                 nxt_df["거래불가사유"] = ""
@@ -571,26 +578,27 @@ def run():
                 .str.replace("단기과열", "과열", regex=False)
                 .str.replace("거래정지", "정지", regex=False)
             )
-            reason_map = nxt_df.drop_duplicates("종목명").set_index("종목명")["비고"].to_dict()
-            nxt_names = set(nxt_df["종목명"])
+            reason_map = nxt_df.drop_duplicates("_code5").set_index("_code5")["비고"].to_dict()
+            nxt_codes = set(nxt_df["_code5"]) - {""}
     except Exception:
-        nxt_names = set()
+        nxt_codes = set()
         reason_map = {}
 
-    # 비고 붙이기(공통)
-    df_all_show["비고"] = df_all_show["종목명"].map(reason_map).fillna("")
+    # 비고 붙이기(종목코드 기준)
+    df_all_show["비고"] = df_all_show["종목코드"].map(reason_map).fillna("")
 
-    # 분기 데이터셋
-    df_nxt_trade = df_all_show[df_all_show["종목명"].isin(nxt_names)].copy()
+    # 분기 데이터셋 (종목코드 기준)
+    df_nxt_trade = df_all_show[df_all_show["종목코드"].isin(nxt_codes)].copy()
 
     # 캡션
     caption_head = f"\n선택: {_menu_label(menu_key).strip()} · 기간: {f} ~ {t} · 총 {len(df_all_show)}건"
 
-    # 컬럼 설정
+    # 컬럼 설정 (종목코드는 매칭용이므로 표시하지 않음)
     colcfg = {
         "당일": st.column_config.TextColumn(width=35),
         "시간": st.column_config.TextColumn(width=98),
         "종목명": st.column_config.TextColumn(width=110),
+        "종목코드": None,
         "비고": st.column_config.TextColumn(width=50, help="NXT 조회 기준 사유(경/위=투자경고/위험, 정지=거래정지)"),
         "공시제목": st.column_config.LinkColumn(
             "공시제목", width=320, help="클릭하면 KRX 뷰어로 이동합니다", display_text=r"#(.+)$"
@@ -617,7 +625,7 @@ def run():
 
     with tab2:
         render_header_with_copy("copy_tab2", caption_head, df_all_show)
-        styled = style_nxt_rows(df_all_show, nxt_names)
+        styled = style_nxt_rows(df_all_show, nxt_codes)
         st.dataframe(
             styled,
             use_container_width=True,
