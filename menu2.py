@@ -1,4 +1,5 @@
 # menu2.py
+# 상장폐지 추가
 from __future__ import annotations
 
 import streamlit as st
@@ -13,6 +14,7 @@ from fnc2 import (
     fetch_investor_warning,     # 4️⃣ 투자경고·위험
     fetch_shortterm_overheat,   # 5️⃣ 단기과열
     fetch_market_watch,         # ✅ 시장감시위원회(사용자 지정) - halt/multi에만 합침
+    fetch_delist,               # 7️⃣ 상장폐지
 )
 
 # NXT 종목 조회 (환경에 따라 없을 수 있으므로 안전 처리)
@@ -41,6 +43,7 @@ MENU_SPEC = [
     ("inv",      "4️⃣ 투자경고·위험 종목", 1),
     ("overheat", "5️⃣ 단기과열 종목",    1),
     ("misc",     "6️⃣ 기타 시장안내",    1),
+    ("delist",   "7️⃣ 상장폐지",        1),
 ]
 
 # 실제 동작 맵
@@ -52,13 +55,14 @@ FETCHER_MAP = {
     "inv":      ("inv",   None,    None),
     "overheat": ("overheat", None, None),
     "misc":     ("cat",   "misc",  None),
+    "delist":   ("delist", None,   None),
 }
 
 # 라벨 포맷터(들여쓰기: U+2003 EM SPACE)
 def _menu_label(key: str) -> str:
     for k, label, level in MENU_SPEC:
         if k == key:
-            return (" " * level) + label
+            return (" " * level) + label
     return key
 
 # 주말이면 가장 가까운 이전 평일로
@@ -246,6 +250,13 @@ def _fetch(menu_key: str, f: str, t: str, page_size: int = 100, nonce: int = 0) 
             df_raw = df_raw[~df_raw["공시제목"].astype(str).str.contains(INV_SUFFIX_EXCLUDE, na=False)]
         return df_raw.reset_index(drop=True)
 
+    # ✅ 상장폐지
+    if ftype == "delist":
+        df_raw = fetch_delist(f, t, page_size=page_size)
+        if not df_raw.empty:
+            df_raw = df_raw[~df_raw["공시제목"].astype(str).str.contains(INV_SUFFIX_EXCLUDE, na=False)]
+        return df_raw.reset_index(drop=True)
+
     # cat
     df_raw = kind_fetch(arg, f, t, page_size=page_size)
 
@@ -293,7 +304,12 @@ def _fetch_multi(f: str, t: str, page_size: int = 100, nonce: int = 0) -> pd.Dat
     if not df_oh.empty:
         df_oh = df_oh[~df_oh["공시제목"].astype(str).str.contains(INV_SUFFIX_EXCLUDE, na=False)]
 
-    dfs = [x for x in [df_halt, df_mgmt, df_alert, df_misc, df_warn, df_oh] if x is not None and not x.empty]
+    # ✅ 상장폐지도 모아보기에 포함
+    df_delist = fetch_delist(f, t, page_size=page_size)
+    if not df_delist.empty:
+        df_delist = df_delist[~df_delist["공시제목"].astype(str).str.contains(INV_SUFFIX_EXCLUDE, na=False)]
+
+    dfs = [x for x in [df_halt, df_mgmt, df_alert, df_misc, df_warn, df_oh, df_delist] if x is not None and not x.empty]
     if not dfs:
         return pd.DataFrame()
 
