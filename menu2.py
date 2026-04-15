@@ -355,7 +355,80 @@ def run():
     """, unsafe_allow_html=True)
 
     st.markdown("### 📡 KRX • NXT 공시 모니터")
+    st.caption("ㅁ   if df_halt_cat_f is not None and not df_halt_cat_f.empty:
+        df_halt_cat_f = df_halt_cat_f[df_halt_cat_f["공시제목"].astype(str).str.contains(HALT_PATTERN, na=False)]
 
+    df_mw = fetch_market_watch(f, t, page_size=page_size)
+    if not df_mw.empty:
+        df_mw = df_mw[~df_mw["공시제목"].astype(str).str.contains(INV_SUFFIX_EXCLUDE, na=False)]
+
+    df_halt = _merge_halt_and_mw(df_halt_cat_f, df_mw)
+
+    # 2) 나머지 기존 로직 그대로
+    df_mgmt  = kind_fetch("mgmt",  f, t, page_size=page_size)
+    df_alert = kind_fetch("alert", f, t, page_size=page_size)
+    df_misc  = kind_fetch("misc",  f, t, page_size=page_size)
+
+    df_warn  = fetch_investor_warning(f, t, page_size=page_size)
+    if not df_warn.empty:
+        df_warn = df_warn[~df_warn["공시제목"].astype(str).str.contains(INV_SUFFIX_EXCLUDE, na=False)]
+
+    df_oh    = fetch_shortterm_overheat(f, t, page_size=page_size)
+    if not df_oh.empty:
+        df_oh = df_oh[~df_oh["공시제목"].astype(str).str.contains(INV_SUFFIX_EXCLUDE, na=False)]
+
+    # ⚠️ 상장폐지도 모아보기에 포함
+    df_delist = fetch_delist(f, t, page_size=page_size)
+    if not df_delist.empty:
+        df_delist = df_delist[~df_delist["공시제목"].astype(str).str.contains(INV_SUFFIX_EXCLUDE, na=False)]
+
+    dfs = [x for x in [df_halt, df_mgmt, df_alert, df_misc, df_warn, df_oh, df_delist] if x is not None and not x.empty]
+    if not dfs:
+        return pd.DataFrame()
+
+    merged = pd.concat(dfs, ignore_index=True, sort=False)
+    if "문서번호" in merged.columns:
+        merged = merged.drop_duplicates(subset=["문서번호"], keep="first")
+    if "시간" in merged.columns:
+        merged["__ts"] = pd.to_datetime(merged["시간"], errors="coerce")
+        merged = merged.sort_values("__ts", ascending=False).drop(columns="__ts")
+    return merged.reset_index(drop=True)
+
+# ─────────────────────────────────────────────────────────────
+# App
+# ─────────────────────────────────────────────────────────────
+def run():
+    st.set_page_config(
+        page_title="KRX • NXT 공시 모니터",
+        layout="centered",
+        initial_sidebar_state="expanded",
+    )
+
+    # 사이드바 너비 + 라디오 간격 CSS
+    SIDEBAR_PX = 380
+    st.markdown(f"""
+    <style>
+    [data-testid="stSidebar"] {{
+      min-width: {SIDEBAR_PX}px; max-width: {SIDEBAR_PX}px;
+    }}
+    [data-testid="stSidebar"] > div:first-child {{ width: {SIDEBAR_PX}px; }}
+    #menu-radio-wrap [role="radiogroup"] {{
+      display: flex; flex-direction: column; row-gap: 10px;
+    }}
+    #menu-radio-wrap [role="radiogroup"] > *:hover {{
+      background: rgba(0,0,0,0.03); border-radius: 8px;
+    }}
+    @media (max-width: 1100px) {{
+      [data-testid="stSidebar"] {{ min-width: 320px; max-width: 320px; }}
+      [data-testid="stSidebar"] > div:first-child {{ width: 320px; }}
+    }}
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("### 📡 KRX • NXT 공시 모니터")
+    st.caption("① 종목코드 기반 NXT매핑")
+    st.caption("② 상장폐지 공시 추가")
+    
     if "menu_cache" not in st.session_state:
         st.session_state["menu_cache"] = {}
     if "force_nonce" not in st.session_state:
