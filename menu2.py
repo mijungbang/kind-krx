@@ -1,5 +1,6 @@
 # menu2.py
 # 상장폐지 추가, 종목코드 매핑 전환
+# menu2.py
 from __future__ import annotations
 
 import streamlit as st
@@ -251,7 +252,7 @@ def _fetch(menu_key: str, f: str, t: str, page_size: int = 100, nonce: int = 0) 
             df_raw = df_raw[~df_raw["공시제목"].astype(str).str.contains(INV_SUFFIX_EXCLUDE, na=False)]
         return df_raw.reset_index(drop=True)
 
-    # ✅ 상장폐지
+    # ⚠️ 상장폐지
     if ftype == "delist":
         df_raw = fetch_delist(f, t, page_size=page_size)
         if not df_raw.empty:
@@ -305,7 +306,7 @@ def _fetch_multi(f: str, t: str, page_size: int = 100, nonce: int = 0) -> pd.Dat
     if not df_oh.empty:
         df_oh = df_oh[~df_oh["공시제목"].astype(str).str.contains(INV_SUFFIX_EXCLUDE, na=False)]
 
-    # ✅ 상장폐지도 모아보기에 포함
+    # ⚠️ 상장폐지도 모아보기에 포함
     df_delist = fetch_delist(f, t, page_size=page_size)
     if not df_delist.empty:
         df_delist = df_delist[~df_delist["공시제목"].astype(str).str.contains(INV_SUFFIX_EXCLUDE, na=False)]
@@ -561,9 +562,9 @@ def run():
             nxt_df = nxt_df.copy()
             nxt_df["종목명"] = nxt_df["종목명"].astype(str)
 
-            # NXT 종목코드: A005680 (7자리) → [1:-1] → 00568 (5자리, KIND 크롤링과 동일)
-            if "종목코드" in nxt_df.columns:
-                nxt_df["_code5"] = nxt_df["종목코드"].astype(str).str[1:-1]
+            # NXT 단축코드: 005680 (6자리, 원본 A005680에서 A 제거 후) → [:5] → 00568 (KIND 5자리와 동일)
+            if "단축코드" in nxt_df.columns:
+                nxt_df["_code5"] = nxt_df["단축코드"].astype(str).str[:5]
             else:
                 nxt_df["_code5"] = ""
 
