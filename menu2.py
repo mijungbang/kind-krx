@@ -354,7 +354,7 @@ def run():
     """, unsafe_allow_html=True)
 
     st.markdown("### 📡 KRX • NXT 공시 모니터")
-    st.caption("① 종목코드 기반 NXT매핑, ② 상장폐지 공시 추가")
+    st.caption("최근 업데이트: ① 종목코드 기반 NXT매핑 ② 상장폐지 공시 추가")
 
     if "menu_cache" not in st.session_state:
         st.session_state["menu_cache"] = {}
