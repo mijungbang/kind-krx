@@ -14,7 +14,7 @@ from fnc2 import (
     fetch_investor_warning,     # 4️⃣ 투자경고·위험
     fetch_shortterm_overheat,   # 5️⃣ 단기과열
     fetch_market_watch,         # ✅ 시장감시위원회(사용자 지정) - halt/multi에만 합침
-    fetch_delist,               # 7️⃣ 상장폐지
+    fetch_delist,               # ⚠️ 상장폐지
 )
 
 # NXT 종목 조회 (환경에 따라 없을 수 있으므로 안전 처리)
@@ -43,7 +43,7 @@ MENU_SPEC = [
     ("inv",      "4️⃣ 투자경고·위험 종목", 1),
     ("overheat", "5️⃣ 단기과열 종목",    1),
     ("misc",     "6️⃣ 기타 시장안내",    1),
-    ("delist",   "7️⃣ 상장폐지",        1),
+    ("delist",   "⚠️ 상장폐지 등",        1),
 ]
 
 # 실제 동작 맵
