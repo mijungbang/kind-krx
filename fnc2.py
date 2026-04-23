@@ -165,7 +165,7 @@ def _kind_disclosure_search(
     page_size: int = 100,
     max_pages: int = 1000,
     sleep: float = 5,
-    timeout: int = 120,
+    timeout: int = 300,
     verify_ssl: bool = False,
     session: Optional[requests.Session] = None,
     report_nm: Optional[str] = None,
@@ -407,7 +407,7 @@ def _fetch_reportcd_with_warn_payload(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 3,
+    sleep: float = 5,
 ) -> pd.DataFrame:
     f = _date_to_str(from_date)
     t = _date_to_str(to_date)
@@ -429,7 +429,7 @@ def _fetch_reportcd_with_warn_payload(
                     "reportNmTemp": nm_temp,
                     "reportNmPop": nm_pop,
                 }
-                r = s.post(KIND_URL, data=payload, timeout=30, verify=False)
+                r = s.post(KIND_URL, data=payload, timeout=300, verify=False)
                 r.raise_for_status()
                 html = r.text
 
@@ -456,7 +456,7 @@ def fetch_investor_warning(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 1,
+    sleep: float = 5,
 ) -> pd.DataFrame:
     """투자경고·위험: 여러 reportCd × 페이지네이션 전체 수집 → 문서번호 중복 제거."""
     return _fetch_reportcd_with_warn_payload(
@@ -471,7 +471,7 @@ def fetch_shortterm_overheat(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 3,
+    sleep: float = 5,
 ) -> pd.DataFrame:
     """단기과열: reportNm='단기과열' 단일 조건 페이지네이션 수집."""
     f = _date_to_str(from_date)
@@ -493,7 +493,7 @@ def fetch_shortterm_overheat(
                 "reportNmTemp": "단기과열",
                 "reportNmPop": "",
             }
-            r = s.post(KIND_URL, data=payload, timeout=30, verify=False)
+            r = s.post(KIND_URL, data=payload, timeout=300, verify=False)
             r.raise_for_status()
             html = r.text
 
@@ -519,7 +519,7 @@ def fetch_market_watch(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 3,
+    sleep: float = 5,
 ) -> pd.DataFrame:
     """시장감시위원회(사용자 지정): 사용자가 준 reportCd 목록을 warn 페이로드 방식으로 조회."""
     return _fetch_reportcd_with_warn_payload(
@@ -534,7 +534,7 @@ def fetch_delist(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 3,
+    sleep: float = 5,
 ) -> pd.DataFrame:
     """상장폐지: 유가증권(68051) + 코스닥(70769) reportCd를 warn 페이로드 방식으로 조회."""
     return _fetch_reportcd_with_warn_payload(
