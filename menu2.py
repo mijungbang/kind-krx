@@ -30,6 +30,12 @@ try:
 except Exception:
     _kind_diagnose = None
 
+try:
+    from fnc2 import pacer_status as _kind_pacer_status
+except Exception:
+    def _kind_pacer_status():
+        return {"delay": 0}
+
 # NXT 종목 조회 (환경에 따라 없을 수 있으므로 안전 처리)
 try:
     from fnc import get_nextrade_filtered_symbols   # (trade_date, df)
@@ -403,10 +409,10 @@ def run():
         )
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # 예상 소요시간 안내 (요청당 약 3초)
+        # 예상 소요시간 안내 (정상 응답 기준. 차단이 걸리면 자동으로 느려짐)
         n_req = APPROX_REQUESTS.get(menu_key, 1)
         if n_req >= 10:
-            st.caption(f"⏱ KIND 요청 약 {n_req}회 · 예상 {n_req * 3 // 60}분 {n_req * 3 % 60}초")
+            st.caption(f"⏱ KIND 요청 약 {n_req}회 · 정상 시 {n_req}~{n_req * 2}초")
 
         st.markdown("---")
 
@@ -531,6 +537,14 @@ def run():
 
         bar.empty()
         elapsed = time.time() - t0
+
+        # 차단 감지로 속도를 늦춘 상태면 알려준다
+        cur_delay = _kind_pacer_status().get("delay", 0)
+        if cur_delay >= 2:
+            st.info(
+                f"⏳ KIND 쪽 저항이 감지돼 요청 간격을 {cur_delay}초로 늦춘 상태입니다. "
+                "연속 성공하면 자동으로 다시 빨라집니다."
+            )
 
         if df_raw is None or df_raw.empty:
             st.warning("해당 조건에 일치하는 데이터가 없습니다.")
