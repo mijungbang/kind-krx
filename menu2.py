@@ -1,6 +1,6 @@
 # menu2.py
 # 상장폐지 추가, 종목코드 매핑 전환
-# + 403 대응: 진행률 표시 / 소스별 부분 실패 허용 / 세션 리셋 / 진단 버튼
+# + 403 대응: 단계별 진행률 / 소스별 부분 실패 허용 / 세션 리셋
 from __future__ import annotations
 
 import streamlit as st
@@ -26,15 +26,15 @@ except Exception:
         return None
 
 try:
-    from fnc2 import diagnose as _kind_diagnose
-except Exception:
-    _kind_diagnose = None
-
-try:
     from fnc2 import pacer_status as _kind_pacer_status
 except Exception:
     def _kind_pacer_status():
         return {"delay": 0}
+
+try:
+    from fnc2 import MAX_INFLIGHT
+except Exception:
+    MAX_INFLIGHT = 1
 
 # NXT 종목 조회 (환경에 따라 없을 수 있으므로 안전 처리)
 try:
@@ -75,13 +75,6 @@ FETCHER_MAP = {
     "misc":     ("cat",   "misc",  None),
     "delist":   ("delist", None,   None),
 }
-
-# 메뉴별 대략적인 KIND 요청 횟수 (예상 소요시간 안내용)
-APPROX_REQUESTS = {
-    "multi": 43, "halt": 25, "mgmt": 1, "alert": 1,
-    "inv": 12, "overheat": 1, "misc": 1, "delist": 2,
-}
-
 
 def _menu_label(key: str) -> str:
     for k, label, level in MENU_SPEC:
@@ -178,6 +171,115 @@ def _df_height(df: pd.DataFrame,
     return max(min_height, min(h, max_height))
 
 
+# ─────────────────────────────────────────────────────────────
+# 진행률 UI — 소스별 상태를 체크리스트로 실시간 표시
+# ─────────────────────────────────────────────────────────────
+class ProgressUI:
+    """
+    steps: [(라벨, 요청수), ...]
+    상태: pending → running → done / failed
+    전체 진행률은 '요청 수' 기준이라 24개짜리 소스가 오래 걸려도 막대가 자연스럽게 움직인다.
+    """
+
+    ICON = {"pending": "·", "running": "▶", "done": "✓", "failed": "✕"}
+
+    def __init__(self, steps):
+        self.steps = [{"label": l, "units": u, "state": "pending",
+                       "done_units": 0, "note": ""} for l, u in steps]
+        self.total = sum(u for _, u in steps) or 1
+        self.t0 = time.time()
+        self.bar = st.progress(0.0, text="KIND 접속 준비 중...")
+        self.box = st.empty()
+        self._render()
+
+    def _idx(self, label):
+        for i, s in enumerate(self.steps):
+            if s["label"] == label:
+                return i
+        return None
+
+    def _completed_units(self):
+        return sum(
+            s["units"] if s["state"] in ("done", "failed") else s["done_units"]
+            for s in self.steps
+        )
+
+    def _render(self, current=""):
+        done_u = self._completed_units()
+        frac = min(done_u / self.total, 1.0)
+        el = time.time() - self.t0
+
+        head = f"{done_u}/{self.total} 요청 · {el:.0f}초"
+        if current:
+            head = f"{current} · {head}"
+        try:
+            self.bar.progress(frac, text=head)
+        except Exception:
+            pass
+
+        lines = []
+        for s in self.steps:
+            icon = self.ICON[s["state"]]
+            label = s["label"]
+            if s["state"] == "running" and s["units"] > 1:
+                detail = f" ({s['done_units']}/{s['units']})"
+            elif s["state"] == "done":
+                detail = f" — {s['note']}" if s["note"] else ""
+            elif s["state"] == "failed":
+                detail = " — 실패"
+            else:
+                detail = ""
+
+            if s["state"] == "pending":
+                lines.append(f"<span style='color:#aaa'>{icon} {label}{detail}</span>")
+            elif s["state"] == "failed":
+                lines.append(f"<span style='color:#c0392b'>{icon} {label}{detail}</span>")
+            elif s["state"] == "running":
+                lines.append(f"<span style='color:#1f6feb;font-weight:600'>{icon} {label}{detail}</span>")
+            else:
+                lines.append(f"<span style='color:#2e7d32'>{icon} {label}{detail}</span>")
+
+        self.box.markdown(
+            "<div style='font-size:0.82rem; line-height:1.7; font-family:ui-monospace,monospace'>"
+            + "<br>".join(lines) + "</div>",
+            unsafe_allow_html=True,
+        )
+
+    def start(self, label):
+        i = self._idx(label)
+        if i is not None:
+            self.steps[i]["state"] = "running"
+        self._render(current=label)
+
+    def unit(self, label, done, total):
+        i = self._idx(label)
+        if i is not None:
+            self.steps[i]["done_units"] = done
+        self._render(current=label)
+
+    def finish(self, label, n_rows=None):
+        i = self._idx(label)
+        if i is not None:
+            self.steps[i]["state"] = "done"
+            self.steps[i]["done_units"] = self.steps[i]["units"]
+            if n_rows is not None:
+                self.steps[i]["note"] = f"{n_rows}건"
+        self._render()
+
+    def fail(self, label):
+        i = self._idx(label)
+        if i is not None:
+            self.steps[i]["state"] = "failed"
+        self._render()
+
+    def clear(self):
+        try:
+            self.bar.empty()
+            self.box.empty()
+        except Exception:
+            pass
+
+
 def render_header_with_copy(copy_id: str, caption_text: str, df_display: pd.DataFrame):
     """캡션(좌) + 복사 버튼(우)을 한 줄에 배치."""
     safe_caption = escape(caption_text).replace("\n", "<br>")
@@ -239,107 +341,81 @@ def _merge_frames(dfs: list) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────
 # 데이터 페치
 #   반환: (DataFrame, 실패한 소스 메시지 리스트)
-#   _progress: 언더스코어 접두 → st.cache_data가 해싱하지 않음
+#   _ui: 언더스코어 접두 → st.cache_data가 해싱하지 않음
 # ─────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False, ttl=60)
-def _fetch(menu_key: str, f: str, t: str, page_size: int = 100,
-           nonce: int = 0, _progress=None) -> tuple[pd.DataFrame, list]:
-    _ = nonce
-    ftype, arg, patt = FETCHER_MAP[menu_key]
-
-    def tick(i, n, label):
-        if _progress:
-            _progress(i / n, label)
-
-    if ftype == "multi":
-        return _fetch_multi(f, t, page_size, nonce=nonce, _progress=_progress)
-
-    if ftype == "inv":
-        tick(0, 1, "투자경고·위험 (12개 코드)")
-        df = _drop_pref(fetch_investor_warning(f, t, page_size=page_size))
-        tick(1, 1, "완료")
-        return (df.reset_index(drop=True) if df is not None and not df.empty else pd.DataFrame()), []
-
-    if ftype == "overheat":
-        tick(0, 1, "단기과열")
-        df = _drop_pref(fetch_shortterm_overheat(f, t, page_size=page_size))
-        tick(1, 1, "완료")
-        return (df.reset_index(drop=True) if df is not None and not df.empty else pd.DataFrame()), []
-
-    if ftype == "delist":
-        tick(0, 1, "상장폐지 (2개 코드)")
-        df = _drop_pref(fetch_delist(f, t, page_size=page_size))
-        tick(1, 1, "완료")
-        return (df.reset_index(drop=True) if df is not None and not df.empty else pd.DataFrame()), []
-
-    # cat 계열
-    if arg == "halt":
-        # halt는 cat + market_watch 두 소스 → 한쪽이 죽어도 나머지는 살린다
-        errors = []
-        tick(0, 2, "거래정지/재개 (카테고리)")
-        try:
-            df_halt = kind_fetch("halt", f, t, page_size=page_size)
-            if df_halt is not None and not df_halt.empty and patt is not None:
-                df_halt = df_halt[df_halt["공시제목"].astype(str).str.contains(patt, na=False)]
-        except Exception as e:
-            df_halt, _ = pd.DataFrame(), errors.append(f"거래정지 카테고리: {e}")
-
-        tick(1, 2, "시장감시위원회 (24개 코드)")
-        try:
-            df_mw = _drop_pref(fetch_market_watch(f, t, page_size=page_size))
-        except Exception as e:
-            df_mw, _ = pd.DataFrame(), errors.append(f"시장감시위원회: {e}")
-
-        tick(2, 2, "완료")
-        if errors and df_halt.empty and (df_mw is None or df_mw.empty):
-            raise RuntimeError(" / ".join(errors))
-        return _merge_frames([df_halt, df_mw]), errors
-
-    tick(0, 1, _menu_label(menu_key).strip())
-    df = kind_fetch(arg, f, t, page_size=page_size)
-    tick(1, 1, "완료")
-    return (df.reset_index(drop=True) if df is not None and not df.empty else pd.DataFrame()), []
-
-
-@st.cache_data(show_spinner=False, ttl=60)
-def _fetch_multi(f: str, t: str, page_size: int = 100,
-                 nonce: int = 0, _progress=None) -> tuple[pd.DataFrame, list]:
-    _ = nonce
-
+# 소스 정의: (키, 라벨, 요청수, 수집함수 팩토리)
+def _source_specs(f: str, t: str, page_size: int):
     def cat_halt():
         df = kind_fetch("halt", f, t, page_size=page_size)
         if df is not None and not df.empty:
             df = df[df["공시제목"].astype(str).str.contains(HALT_PATTERN, na=False)]
         return df
 
-    # (라벨, 수집함수) — 하나가 실패해도 나머지는 계속 진행
-    steps = [
-        ("거래정지/재개 (카테고리)",     cat_halt),
-        ("시장감시위원회 (24개 코드)",   lambda: _drop_pref(fetch_market_watch(f, t, page_size=page_size))),
-        ("관리종목",                   lambda: kind_fetch("mgmt", f, t, page_size=page_size)),
-        ("투자주의환기",                lambda: kind_fetch("alert", f, t, page_size=page_size)),
-        ("기타 시장안내",               lambda: kind_fetch("misc", f, t, page_size=page_size)),
-        ("투자경고·위험 (12개 코드)",    lambda: _drop_pref(fetch_investor_warning(f, t, page_size=page_size))),
-        ("단기과열",                   lambda: _drop_pref(fetch_shortterm_overheat(f, t, page_size=page_size))),
-        ("상장폐지 (2개 코드)",         lambda: _drop_pref(fetch_delist(f, t, page_size=page_size))),
-    ]
+    return {
+        "halt_cat":  ("거래정지/재개 (카테고리)",   1,  lambda cb: cat_halt()),
+        "mw":        ("시장감시위원회",            23, lambda cb: _drop_pref(fetch_market_watch(f, t, page_size=page_size, on_unit=cb))),
+        "mgmt":      ("관리종목",                 1,  lambda cb: kind_fetch("mgmt", f, t, page_size=page_size)),
+        "alert":     ("투자주의환기",              1,  lambda cb: kind_fetch("alert", f, t, page_size=page_size)),
+        "misc":      ("기타 시장안내",             1,  lambda cb: kind_fetch("misc", f, t, page_size=page_size)),
+        "inv":       ("투자경고·위험",             12, lambda cb: _drop_pref(fetch_investor_warning(f, t, page_size=page_size, on_unit=cb))),
+        "overheat":  ("단기과열",                 1,  lambda cb: _drop_pref(fetch_shortterm_overheat(f, t, page_size=page_size))),
+        "delist":    ("상장폐지",                 2,  lambda cb: _drop_pref(fetch_delist(f, t, page_size=page_size, on_unit=cb))),
+    }
+
+
+MENU_SOURCES = {
+    "multi":    ["halt_cat", "mw", "mgmt", "alert", "misc", "inv", "overheat", "delist"],
+    "halt":     ["halt_cat", "mw"],
+    "mgmt":     ["mgmt"],
+    "alert":    ["alert"],
+    "misc":     ["misc"],
+    "inv":      ["inv"],
+    "overheat": ["overheat"],
+    "delist":   ["delist"],
+}
+
+
+def plan_steps(menu_key: str):
+    """진행률 UI 초기화용 (라벨, 요청수) 목록."""
+    specs = _source_specs("", "", 100)
+    return [(specs[k][0], specs[k][1]) for k in MENU_SOURCES[menu_key]]
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def _fetch(menu_key: str, f: str, t: str, page_size: int = 100,
+           nonce: int = 0, _ui=None) -> tuple[pd.DataFrame, list]:
+    """
+    선택 메뉴에 해당하는 소스들을 수집.
+    소스 하나가 실패해도 나머지는 살리고, 전부 실패할 때만 예외를 올린다.
+    """
+    _ = nonce
+    specs = _source_specs(f, t, page_size)
+    keys = MENU_SOURCES[menu_key]
 
     frames, errors = [], []
-    n = len(steps)
-    for i, (label, fn) in enumerate(steps):
-        if _progress:
-            _progress(i / n, label)
+
+    for key in keys:
+        label, _units, fn = specs[key]
+        if _ui:
+            _ui.start(label)
+
+        cb = (lambda done, total, _l=label: _ui.unit(_l, done, total)) if _ui else None
+
         try:
-            df = fn()
-            if df is not None and not df.empty:
+            df = fn(cb)
+            # fnc2가 부분 실패를 df.attrs에 담아 보낸다
+            if df is not None and df.attrs.get("kind_errors"):
+                errors += [f"{label} → {m}" for m in df.attrs["kind_errors"]]
+            n = 0 if df is None or df.empty else len(df)
+            if n:
                 frames.append(df)
+            if _ui:
+                _ui.finish(label, n)
         except Exception as e:
             errors.append(f"{label}: {e}")
+            if _ui:
+                _ui.fail(label)
 
-    if _progress:
-        _progress(1.0, "병합 중")
-
-    # 전부 실패하면 예외로 올려서 기존 에러 화면을 띄운다
     if not frames and errors:
         raise RuntimeError(" / ".join(errors))
 
@@ -409,10 +485,10 @@ def run():
         )
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # 예상 소요시간 안내 (정상 응답 기준. 차단이 걸리면 자동으로 느려짐)
-        n_req = APPROX_REQUESTS.get(menu_key, 1)
+        # 예상 소요시간 안내 (병렬 수집 기준. 차단이 걸리면 자동으로 느려짐)
+        n_req = sum(u for _, u in plan_steps(menu_key))
         if n_req >= 10:
-            st.caption(f"⏱ KIND 요청 약 {n_req}회 · 정상 시 {n_req}~{n_req * 2}초")
+            st.caption(f"⏱ KIND 요청 {n_req}회 · 최대 {MAX_INFLIGHT}개 동시 · 정상 시 5~15초")
 
         st.markdown("---")
 
@@ -475,18 +551,6 @@ def run():
                 st.toast("캐시/세션을 초기화했습니다.", icon="🧹")
                 st.rerun()
 
-        # 진단
-        if _kind_diagnose is not None:
-            with st.expander("🩺 접속 진단"):
-                st.caption("배포 환경에서 KIND가 어느 단계부터 막히는지 확인합니다.")
-                if st.button("진단 실행", use_container_width=True):
-                    with st.spinner("진단 중..."):
-                        try:
-                            st.session_state["diag"] = _kind_diagnose()
-                        except Exception as e:
-                            st.session_state["diag"] = {"error": str(e)}
-                if st.session_state.get("diag"):
-                    st.json(st.session_state["diag"], expanded=False)
 
     # 강제 새로조회 후 자동 실행
     go = go or st.session_state.pop("auto_go", False)
@@ -503,39 +567,29 @@ def run():
     fetch_errors: list = []
 
     if go:
-        prog_box = st.container()
-        with prog_box:
-            bar = st.progress(0.0, text="KIND 접속 준비 중...")
-
-        def _progress(frac: float, label: str):
-            try:
-                bar.progress(min(max(frac, 0.0), 1.0), text=f"수집 중 · {label}")
-            except Exception:
-                pass
-
+        ui = ProgressUI(plan_steps(menu_key))
         t0 = time.time()
         try:
             df_raw, fetch_errors = _fetch(
                 menu_key, f, t, page_size=100,
                 nonce=st.session_state["force_nonce"],
-                _progress=_progress,
+                _ui=ui,
             )
         except Exception as e:
-            bar.empty()
+            ui.clear()
             st.error("KIND 응답이 비정상입니다(차단/오류 가능).")
             st.code(str(e))
             if "403" in str(e):
                 st.warning(
                     "**403은 서버 IP 차단일 가능성이 큽니다.** "
-                    "사이드바의 🩺 접속 진단을 실행해 `main_get` / `details_get` 단계부터 "
-                    "막히는지 확인해 보세요. GET부터 403이면 코드로는 해결되지 않고, "
+                    "🔄 강제 새로조회로도 계속 같은 오류가 나면 코드로는 해결되지 않고, "
                     "국내 리전(예: Oracle Cloud 춘천/서울, NHN Cloud)으로 옮겨야 합니다."
                 )
             else:
                 st.info("🔄 강제 새로조회 → 안 되면 🧹 초기화 → 그래도 안 되면 조회기간을 줄여보세요.")
             return
 
-        bar.empty()
+        ui.clear()
         elapsed = time.time() - t0
 
         # 차단 감지로 속도를 늦춘 상태면 알려준다
