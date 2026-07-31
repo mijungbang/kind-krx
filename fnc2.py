@@ -4,6 +4,7 @@
 #  - 브라우저 유사 헤더(Accept-Language, Sec-Fetch-*)
 #  - 403/429/503 시 세션 재생성 + 지수 백오프 재시도
 #  - 적응형 페이싱: 평상시엔 대기 없음, 저항이 감지될 때만 느려지고 회복되면 다시 빨라짐
+#  - reportCd 병렬 수집(전역 in-flight 상한으로 제어)
 #  - sleep 인자는 하위호환용으로만 남아 있으며 무시됨(_PACER가 대체)
 from __future__ import annotations
 
@@ -11,6 +12,7 @@ import re
 import time
 import random
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict, List, Tuple
 
 import requests
@@ -92,44 +94,55 @@ DETAILS_REFERER = f"{KIND_URL}?method=searchDetailsMain"
 #   정상일 때는 대기 없음. 저항(403/429/비정상HTML)이 감지될 때만 지연이 붙고,
 #   연속 성공하면 다시 0으로 내려온다.
 # ─────────────────────────────────────────────────────────────
-PACE_FLOOR = 0.3      # 평상시 최소 간격(초). 0으로 두면 전혀 쉬지 않음
+PACE_FLOOR = 0.05     # 평상시 요청 간 최소 간격(초)
 PACE_FIRST = 2.0      # 첫 저항 감지 시 걸리는 지연
 PACE_CEILING = 30.0   # 지연 상한
 PACE_RECOVER_AFTER = 4  # 연속 성공 N회마다 지연 절반으로
 
+MAX_INFLIGHT = 6      # 동시에 날아갈 수 있는 KIND 요청 수(전역 상한)
+
 
 class _Pacer:
-    """저항이 있을 때만 느려지는 요청 간격 조절기."""
+    """저항이 있을 때만 느려지는 요청 간격 조절기. 스레드 안전."""
 
     def __init__(self):
+        self._lk = threading.Lock()
         self.delay = PACE_FLOOR
         self.ok_streak = 0
         self.last_at = 0.0
 
     def wait(self) -> None:
-        if self.delay <= 0:
+        """직전 요청과의 간격을 확보한다. 락 안에서 자므로 전역 직렬 간격이 된다."""
+        with self._lk:
+            gap = time.time() - self.last_at
+            d = self.delay
+            if gap < d:
+                time.sleep(d - gap + random.uniform(0, d * 0.2))
             self.last_at = time.time()
-            return
-        gap = time.time() - self.last_at
-        if gap < self.delay:
-            time.sleep(self.delay - gap + random.uniform(0, self.delay * 0.2))
-        self.last_at = time.time()
 
     def on_success(self) -> None:
-        self.ok_streak += 1
-        if self.delay > PACE_FLOOR and self.ok_streak >= PACE_RECOVER_AFTER:
-            self.delay = max(PACE_FLOOR, self.delay / 2)
-            self.ok_streak = 0
+        with self._lk:
+            self.ok_streak += 1
+            if self.delay > PACE_FLOOR and self.ok_streak >= PACE_RECOVER_AFTER:
+                self.delay = max(PACE_FLOOR, self.delay / 2)
+                self.ok_streak = 0
 
     def on_trouble(self) -> None:
-        self.ok_streak = 0
-        self.delay = min(PACE_CEILING, max(PACE_FIRST, self.delay * 2))
+        with self._lk:
+            self.ok_streak = 0
+            self.delay = min(PACE_CEILING, max(PACE_FIRST, self.delay * 2))
+
+    @property
+    def degraded(self) -> bool:
+        return self.delay > PACE_FLOOR
 
     def status(self) -> dict:
-        return {"delay": round(self.delay, 2), "ok_streak": self.ok_streak}
+        return {"delay": round(self.delay, 2), "ok_streak": self.ok_streak,
+                "degraded": self.degraded}
 
 
 _PACER = _Pacer()
+_INFLIGHT = threading.Semaphore(MAX_INFLIGHT)
 
 
 def pacer_status() -> dict:
@@ -148,6 +161,7 @@ CODE_MAP: Dict[str, str] = {
 # 세션 관리 (전역 1개 재사용 + 워밍업)
 # ─────────────────────────────────────────────────────────────
 _SESSION: Optional[requests.Session] = None
+_SESSION_GEN = 0
 _LOCK = threading.Lock()
 
 
@@ -155,6 +169,10 @@ def _build_session(timeout: int = 30) -> requests.Session:
     """새 세션 + 메인/상세검색 GET 워밍업으로 JSESSIONID 확보."""
     s = requests.Session()
     s.headers.update(NAV_HEADERS)
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=MAX_INFLIGHT, pool_maxsize=MAX_INFLIGHT
+    )
+    s.mount("https://", adapter)
 
     _PACER.wait()
     s.get(
@@ -172,10 +190,15 @@ def _build_session(timeout: int = 30) -> requests.Session:
     return s
 
 
-def get_session(force_new: bool = False) -> requests.Session:
-    global _SESSION
+def get_session(stale_gen: Optional[int] = None) -> Tuple[requests.Session, int]:
+    """
+    (세션, 세대번호)를 돌려준다.
+    stale_gen을 주면 '내가 쓰던 그 세션이 아직 현역일 때만' 재생성한다.
+    → 여러 스레드가 동시에 403을 맞아도 세션은 한 번만 다시 만들어진다.
+    """
+    global _SESSION, _SESSION_GEN
     with _LOCK:
-        if force_new and _SESSION is not None:
+        if _SESSION is not None and stale_gen is not None and stale_gen == _SESSION_GEN:
             try:
                 _SESSION.close()
             except Exception:
@@ -183,12 +206,13 @@ def get_session(force_new: bool = False) -> requests.Session:
             _SESSION = None
         if _SESSION is None:
             _SESSION = _build_session()
-        return _SESSION
+            _SESSION_GEN += 1
+        return _SESSION, _SESSION_GEN
 
 
 def reset_session() -> None:
-    """menu2.py의 🧹 초기화 버튼에서 함께 호출하면 좋습니다."""
-    global _SESSION
+    """menu2.py의 🧹 초기화 / 🔄 강제 새로조회에서 호출."""
+    global _SESSION, _SESSION_GEN
     with _LOCK:
         if _SESSION is not None:
             try:
@@ -196,6 +220,7 @@ def reset_session() -> None:
             except Exception:
                 pass
         _SESSION = None
+        _SESSION_GEN += 1
 
 
 # ─────────────────────────────────────────────────────────────
@@ -217,13 +242,17 @@ def _post_kind(
     성공 시 HTML 문자열 반환.
     """
     last_err = None
+    stale_gen: Optional[int] = None
+
     for attempt in range(tries):
-        s = get_session(force_new=(attempt > 0))
+        s, gen = get_session(stale_gen=stale_gen)
         headers = {**AJAX_HEADERS, "Referer": referer}
         try:
-            _PACER.wait()
-            r = s.post(KIND_URL, data=payload, headers=headers,
-                       timeout=timeout, verify=False)
+            # 전역 동시 요청 상한 + 간격 확보
+            with _INFLIGHT:
+                _PACER.wait()
+                r = s.post(KIND_URL, data=payload, headers=headers,
+                           timeout=timeout, verify=False)
 
             if r.status_code in (403, 429, 503):
                 last_err = f"HTTP {r.status_code}"
@@ -240,8 +269,9 @@ def _post_kind(
         except requests.RequestException as e:
             last_err = f"{type(e).__name__}: {e}"
 
-        # ⚠️ 여기부터가 "늘어질 때"— 이제서야 지연을 건다
+        # ⚠️ 여기부터가 "늘어질 때" — 이제서야 지연을 건다
         _PACER.on_trouble()
+        stale_gen = gen                      # 이 세대는 버린다
         if attempt < tries - 1:
             time.sleep((2 ** attempt) * 4 + random.uniform(0, 2))
 
@@ -563,6 +593,33 @@ TARGETS_DELIST: List[Tuple[str, str, str, str]] = [
 ]
 
 
+def _fetch_one_target(
+    f: str, t: str, target: Tuple[str, str, str, str],
+    page_size: int, max_pages: int,
+) -> List[List[str]]:
+    """reportCd 하나를 페이지네이션으로 끝까지 수집. 페이지는 순차(다음 페이지 존재 여부를 알아야 하므로)."""
+    nm, cd, nm_temp, nm_pop = target
+    rows: List[List[str]] = []
+    for page in range(1, max_pages + 1):
+        payload = {
+            **BASE_PAYLOAD_WARN,
+            "currentPageSize": str(page_size),
+            "pageIndex": str(page),
+            "fromDate": f,
+            "toDate": t,
+            "reportNm": nm,
+            "reportCd": cd,
+            "reportNmTemp": nm_temp,
+            "reportNmPop": nm_pop,
+        }
+        html = _post_kind(payload)
+        before = len(rows)
+        rows += _parse_rows_html(html)
+        if len(rows) - before < int(page_size):
+            break
+    return rows
+
+
 def _fetch_reportcd_with_warn_payload(
     from_date: str,
     to_date: str,
@@ -570,51 +627,64 @@ def _fetch_reportcd_with_warn_payload(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 0,
+    sleep: float = 0,          # 하위호환용, 무시됨
+    on_unit=None,              # 콜백(done, total) — 진행률 표시용
 ) -> pd.DataFrame:
+    """
+    reportCd들을 병렬로 수집한다. 동시 요청 수는 _INFLIGHT 세마포어가 전역으로 제한하고,
+    저항이 감지되면 _PACER가 간격을 벌려 자연스럽게 직렬에 가깝게 느려진다.
+    일부 reportCd가 실패해도 나머지는 살리고, 실패 내역은 df.attrs["kind_errors"]에 담는다.
+    """
     f = _date_to_str(from_date)
     t = _date_to_str(to_date)
+
     rows: List[List[str]] = []
+    errors: List[str] = []
+    total = len(targets)
+    done = 0
+    workers = max(1, min(MAX_INFLIGHT, total))
 
-    for nm, cd, nm_temp, nm_pop in targets:
-        for page in range(1, max_pages + 1):
-            payload = {
-                **BASE_PAYLOAD_WARN,
-                "currentPageSize": str(page_size),
-                "pageIndex": str(page),
-                "fromDate": f,
-                "toDate": t,
-                "reportNm": nm,
-                "reportCd": cd,
-                "reportNmTemp": nm_temp,
-                "reportNmPop": nm_pop,
-            }
-            html = _post_kind(payload)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {
+            ex.submit(_fetch_one_target, f, t, tgt, page_size, max_pages): tgt
+            for tgt in targets
+        }
+        for fut in as_completed(futs):
+            nm, cd = futs[fut][0], futs[fut][1]
+            try:
+                rows.extend(fut.result())
+            except Exception as e:
+                errors.append(f"[{cd}] {nm}: {e}")
+            done += 1
+            if on_unit:
+                try:
+                    on_unit(done, total)
+                except Exception:
+                    pass
 
-            before = len(rows)
-            rows += _parse_rows_html(html)
-            added = len(rows) - before
+    if errors and not rows:
+        raise RuntimeError(" / ".join(errors))
 
-            if added == 0 or added < int(page_size):
-                break
-
-    return _make_df(rows)
+    df = _make_df(rows)
+    if errors:
+        df.attrs["kind_errors"] = errors
+    return df
 
 
 def fetch_investor_warning(
     from_date: str, to_date: str, *,
-    page_size: int = 100, max_pages: int = 1000, sleep: float = 0,
+    page_size: int = 100, max_pages: int = 1000, sleep: float = 0, on_unit=None,
 ) -> pd.DataFrame:
     """투자경고·위험: 여러 reportCd × 페이지네이션 전체 수집 → 문서번호 중복 제거."""
     return _fetch_reportcd_with_warn_payload(
         from_date, to_date, TARGETS_WARN,
-        page_size=page_size, max_pages=max_pages, sleep=sleep
+        page_size=page_size, max_pages=max_pages, on_unit=on_unit
     )
 
 
 def fetch_shortterm_overheat(
     from_date: str, to_date: str, *,
-    page_size: int = 100, max_pages: int = 1000, sleep: float = 0,
+    page_size: int = 100, max_pages: int = 1000, sleep: float = 0, on_unit=None,
 ) -> pd.DataFrame:
     """단기과열: reportNm='단기과열' 단일 조건 페이지네이션 수집."""
     f = _date_to_str(from_date)
@@ -647,23 +717,23 @@ def fetch_shortterm_overheat(
 
 def fetch_market_watch(
     from_date: str, to_date: str, *,
-    page_size: int = 100, max_pages: int = 1000, sleep: float = 0,
+    page_size: int = 100, max_pages: int = 1000, sleep: float = 0, on_unit=None,
 ) -> pd.DataFrame:
     """시장감시위원회: reportCd 목록을 warn 페이로드 방식으로 조회."""
     return _fetch_reportcd_with_warn_payload(
         from_date, to_date, TARGETS_MARKET_WATCH,
-        page_size=page_size, max_pages=max_pages, sleep=sleep
+        page_size=page_size, max_pages=max_pages, on_unit=on_unit
     )
 
 
 def fetch_delist(
     from_date: str, to_date: str, *,
-    page_size: int = 100, max_pages: int = 1000, sleep: float = 0,
+    page_size: int = 100, max_pages: int = 1000, sleep: float = 0, on_unit=None,
 ) -> pd.DataFrame:
     """상장폐지: 유가증권(68051) + 코스닥(70769)."""
     return _fetch_reportcd_with_warn_payload(
         from_date, to_date, TARGETS_DELIST,
-        page_size=page_size, max_pages=max_pages, sleep=sleep
+        page_size=page_size, max_pages=max_pages, on_unit=on_unit
     )
 
 
