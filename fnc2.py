@@ -3,7 +3,8 @@
 #  - 전역 세션 재사용 + GET 워밍업(JSESSIONID 확보)
 #  - 브라우저 유사 헤더(Accept-Language, Sec-Fetch-*)
 #  - 403/429/503 시 세션 재생성 + 지수 백오프 재시도
-#  - reportCd 사이 sleep 누락 버그 수정
+#  - 적응형 페이싱: 평상시엔 대기 없음, 저항이 감지될 때만 느려지고 회복되면 다시 빨라짐
+#  - sleep 인자는 하위호환용으로만 남아 있으며 무시됨(_PACER가 대체)
 from __future__ import annotations
 
 import re
@@ -30,6 +31,7 @@ __all__ = [
     "fetch_market_watch",
     "fetch_delist",
     "reset_session",
+    "pacer_status",
     "diagnose",
 ]
 
@@ -85,6 +87,55 @@ AJAX_HEADERS = {
 
 DETAILS_REFERER = f"{KIND_URL}?method=searchDetailsMain"
 
+# ─────────────────────────────────────────────────────────────
+# 적응형 페이싱
+#   정상일 때는 대기 없음. 저항(403/429/비정상HTML)이 감지될 때만 지연이 붙고,
+#   연속 성공하면 다시 0으로 내려온다.
+# ─────────────────────────────────────────────────────────────
+PACE_FLOOR = 0.3      # 평상시 최소 간격(초). 0으로 두면 전혀 쉬지 않음
+PACE_FIRST = 2.0      # 첫 저항 감지 시 걸리는 지연
+PACE_CEILING = 30.0   # 지연 상한
+PACE_RECOVER_AFTER = 4  # 연속 성공 N회마다 지연 절반으로
+
+
+class _Pacer:
+    """저항이 있을 때만 느려지는 요청 간격 조절기."""
+
+    def __init__(self):
+        self.delay = PACE_FLOOR
+        self.ok_streak = 0
+        self.last_at = 0.0
+
+    def wait(self) -> None:
+        if self.delay <= 0:
+            self.last_at = time.time()
+            return
+        gap = time.time() - self.last_at
+        if gap < self.delay:
+            time.sleep(self.delay - gap + random.uniform(0, self.delay * 0.2))
+        self.last_at = time.time()
+
+    def on_success(self) -> None:
+        self.ok_streak += 1
+        if self.delay > PACE_FLOOR and self.ok_streak >= PACE_RECOVER_AFTER:
+            self.delay = max(PACE_FLOOR, self.delay / 2)
+            self.ok_streak = 0
+
+    def on_trouble(self) -> None:
+        self.ok_streak = 0
+        self.delay = min(PACE_CEILING, max(PACE_FIRST, self.delay * 2))
+
+    def status(self) -> dict:
+        return {"delay": round(self.delay, 2), "ok_streak": self.ok_streak}
+
+
+_PACER = _Pacer()
+
+
+def pacer_status() -> dict:
+    """menu2.py에서 현재 지연 상태를 보여줄 때 사용."""
+    return _PACER.status()
+
 # 카테고리 코드 (세부검색 disTypevalue)
 CODE_MAP: Dict[str, str] = {
     "halt":  "0311",   # 거래정지/재개
@@ -93,24 +144,11 @@ CODE_MAP: Dict[str, str] = {
     "misc":  "0305",   # 기타 시장안내
 }
 
-# 요청 간 최소 간격(초). WAF 회피의 핵심.
-MIN_INTERVAL = 2.5
-
 # ─────────────────────────────────────────────────────────────
 # 세션 관리 (전역 1개 재사용 + 워밍업)
 # ─────────────────────────────────────────────────────────────
 _SESSION: Optional[requests.Session] = None
 _LOCK = threading.Lock()
-_LAST_REQ_AT = 0.0
-
-
-def _throttle() -> None:
-    """전역 최소 요청 간격 보장."""
-    global _LAST_REQ_AT
-    gap = time.time() - _LAST_REQ_AT
-    if gap < MIN_INTERVAL:
-        time.sleep(MIN_INTERVAL - gap + random.uniform(0, 0.6))
-    _LAST_REQ_AT = time.time()
 
 
 def _build_session(timeout: int = 30) -> requests.Session:
@@ -118,14 +156,14 @@ def _build_session(timeout: int = 30) -> requests.Session:
     s = requests.Session()
     s.headers.update(NAV_HEADERS)
 
-    _throttle()
+    _PACER.wait()
     s.get(
         MAIN_URL, params={"method": "loadInitPage"},
         timeout=timeout, verify=False,
         headers={"Sec-Fetch-Site": "none"},
     )
 
-    _throttle()
+    _PACER.wait()
     s.get(
         KIND_URL, params={"method": "searchDetailsMain"},
         timeout=timeout, verify=False,
@@ -183,7 +221,7 @@ def _post_kind(
         s = get_session(force_new=(attempt > 0))
         headers = {**AJAX_HEADERS, "Referer": referer}
         try:
-            _throttle()
+            _PACER.wait()
             r = s.post(KIND_URL, data=payload, headers=headers,
                        timeout=timeout, verify=False)
 
@@ -194,6 +232,7 @@ def _post_kind(
                 r.encoding = r.apparent_encoding
                 html = r.text
                 if _looks_like_valid_kind_table(html):
+                    _PACER.on_success()      # ✅ 잘 돌면 지연이 다시 줄어든다
                     return html
                 snippet = re.sub(r"\s+", " ", html)[:200]
                 last_err = f"정상 테이블 아님: {snippet}"
@@ -201,9 +240,10 @@ def _post_kind(
         except requests.RequestException as e:
             last_err = f"{type(e).__name__}: {e}"
 
-        # 백오프: 5s → 11s → 23s (+지터)
+        # ⚠️ 여기부터가 "늘어질 때"— 이제서야 지연을 건다
+        _PACER.on_trouble()
         if attempt < tries - 1:
-            time.sleep((2 ** attempt) * 5 + random.uniform(0, 3))
+            time.sleep((2 ** attempt) * 4 + random.uniform(0, 2))
 
     raise RuntimeError(
         f"KIND 요청 실패(재시도 {tries}회). 마지막 오류: {last_err}\n"
@@ -329,7 +369,7 @@ def _kind_disclosure_search(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 3,
+    sleep: float = 0,
     report_nm: Optional[str] = None,
     report_cd: Optional[str] = None,
 ) -> pd.DataFrame:
@@ -387,8 +427,7 @@ def _kind_disclosure_search(
 
         if added == 0 or added < int(page_size):
             break
-        if sleep:
-            time.sleep(sleep + random.uniform(0, 1))
+        # 페이싱은 _post_kind 내부의 _PACER가 담당 (정상이면 대기 없음)
 
     df = pd.DataFrame(rows, columns=cols)
     if not df.empty and "회사명" in df.columns:
@@ -531,17 +570,13 @@ def _fetch_reportcd_with_warn_payload(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 3,
+    sleep: float = 0,
 ) -> pd.DataFrame:
     f = _date_to_str(from_date)
     t = _date_to_str(to_date)
     rows: List[List[str]] = []
 
-    for idx, (nm, cd, nm_temp, nm_pop) in enumerate(targets):
-        # ✅ reportCd 사이에도 반드시 쉬어간다 (기존 버그: break로 sleep을 건너뜀)
-        if idx > 0 and sleep:
-            time.sleep(sleep + random.uniform(0, 1))
-
+    for nm, cd, nm_temp, nm_pop in targets:
         for page in range(1, max_pages + 1):
             payload = {
                 **BASE_PAYLOAD_WARN,
@@ -562,15 +597,13 @@ def _fetch_reportcd_with_warn_payload(
 
             if added == 0 or added < int(page_size):
                 break
-            if sleep:
-                time.sleep(sleep + random.uniform(0, 1))
 
     return _make_df(rows)
 
 
 def fetch_investor_warning(
     from_date: str, to_date: str, *,
-    page_size: int = 100, max_pages: int = 1000, sleep: float = 3,
+    page_size: int = 100, max_pages: int = 1000, sleep: float = 0,
 ) -> pd.DataFrame:
     """투자경고·위험: 여러 reportCd × 페이지네이션 전체 수집 → 문서번호 중복 제거."""
     return _fetch_reportcd_with_warn_payload(
@@ -581,7 +614,7 @@ def fetch_investor_warning(
 
 def fetch_shortterm_overheat(
     from_date: str, to_date: str, *,
-    page_size: int = 100, max_pages: int = 1000, sleep: float = 3,
+    page_size: int = 100, max_pages: int = 1000, sleep: float = 0,
 ) -> pd.DataFrame:
     """단기과열: reportNm='단기과열' 단일 조건 페이지네이션 수집."""
     f = _date_to_str(from_date)
@@ -608,15 +641,13 @@ def fetch_shortterm_overheat(
 
         if added == 0 or added < int(page_size):
             break
-        if sleep:
-            time.sleep(sleep + random.uniform(0, 1))
 
     return _make_df(rows)
 
 
 def fetch_market_watch(
     from_date: str, to_date: str, *,
-    page_size: int = 100, max_pages: int = 1000, sleep: float = 3,
+    page_size: int = 100, max_pages: int = 1000, sleep: float = 0,
 ) -> pd.DataFrame:
     """시장감시위원회: reportCd 목록을 warn 페이로드 방식으로 조회."""
     return _fetch_reportcd_with_warn_payload(
@@ -627,7 +658,7 @@ def fetch_market_watch(
 
 def fetch_delist(
     from_date: str, to_date: str, *,
-    page_size: int = 100, max_pages: int = 1000, sleep: float = 3,
+    page_size: int = 100, max_pages: int = 1000, sleep: float = 0,
 ) -> pd.DataFrame:
     """상장폐지: 유가증권(68051) + 코스닥(70769)."""
     return _fetch_reportcd_with_warn_payload(
