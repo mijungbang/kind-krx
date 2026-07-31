@@ -1,14 +1,26 @@
 # fnc2.py
-# 상장폐지 추가
+# 상장폐지 추가 + 403 대응 패치
+#  - 전역 세션 재사용 + GET 워밍업(JSESSIONID 확보)
+#  - 브라우저 유사 헤더(Accept-Language, Sec-Fetch-*)
+#  - 403/429/503 시 세션 재생성 + 지수 백오프 재시도
+#  - reportCd 사이 sleep 누락 버그 수정
 from __future__ import annotations
 
 import re
 import time
+import random
+import threading
 from typing import Optional, Dict, List, Tuple
 
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
+
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
 
 __all__ = [
     "CODE_MAP",
@@ -17,32 +29,190 @@ __all__ = [
     "fetch_shortterm_overheat",
     "fetch_market_watch",
     "fetch_delist",
+    "reset_session",
+    "diagnose",
 ]
 
 # ─────────────────────────────────────────────────────────────
 # 상수
 # ─────────────────────────────────────────────────────────────
+BASE = "https://kind.krx.co.kr"
+KIND_URL = f"{BASE}/disclosure/details.do"
+MAIN_URL = f"{BASE}/main.do"
+
 VIEWER_BASE = (
     "https://kind.krx.co.kr/common/disclsviewer.do?"
     "method=search&acptno={docno}&docno=&viewerhost=&viewerport="
 )
+
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 )
 
-# 카테고리 코드 (세부검색 disTypevalue)
-CODE_MAP: Dict[str, str] = {
-    "halt":  "0311",  # 거래정지/재개
-    "mgmt":  "0350",  # 관리종목
-    "alert": "0356",  # 투자주의·환기
-    "misc":  "0305",  # 기타 시장안내
+# 문서 요청용(워밍업)
+NAV_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "sec-ch-ua": '"Chromium";v="141", "Not?A_Brand";v="24", "Google Chrome";v="141"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
 }
 
-KIND_URL = "https://kind.krx.co.kr/disclosure/details.do"
+# XHR 요청용
+AJAX_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "text/html, */*; q=0.01",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "Origin": BASE,
+    "X-Requested-With": "XMLHttpRequest",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "sec-ch-ua": '"Chromium";v="141", "Not?A_Brand";v="24", "Google Chrome";v="141"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
+
+DETAILS_REFERER = f"{KIND_URL}?method=searchDetailsMain"
+
+# 카테고리 코드 (세부검색 disTypevalue)
+CODE_MAP: Dict[str, str] = {
+    "halt":  "0311",   # 거래정지/재개
+    "mgmt":  "0350",   # 관리종목
+    "alert": "0356",   # 투자주의·환기
+    "misc":  "0305",   # 기타 시장안내
+}
+
+# 요청 간 최소 간격(초). WAF 회피의 핵심.
+MIN_INTERVAL = 2.5
 
 # ─────────────────────────────────────────────────────────────
-# 유틸
+# 세션 관리 (전역 1개 재사용 + 워밍업)
+# ─────────────────────────────────────────────────────────────
+_SESSION: Optional[requests.Session] = None
+_LOCK = threading.Lock()
+_LAST_REQ_AT = 0.0
+
+
+def _throttle() -> None:
+    """전역 최소 요청 간격 보장."""
+    global _LAST_REQ_AT
+    gap = time.time() - _LAST_REQ_AT
+    if gap < MIN_INTERVAL:
+        time.sleep(MIN_INTERVAL - gap + random.uniform(0, 0.6))
+    _LAST_REQ_AT = time.time()
+
+
+def _build_session(timeout: int = 30) -> requests.Session:
+    """새 세션 + 메인/상세검색 GET 워밍업으로 JSESSIONID 확보."""
+    s = requests.Session()
+    s.headers.update(NAV_HEADERS)
+
+    _throttle()
+    s.get(
+        MAIN_URL, params={"method": "loadInitPage"},
+        timeout=timeout, verify=False,
+        headers={"Sec-Fetch-Site": "none"},
+    )
+
+    _throttle()
+    s.get(
+        KIND_URL, params={"method": "searchDetailsMain"},
+        timeout=timeout, verify=False,
+        headers={"Referer": f"{MAIN_URL}?method=loadInitPage"},
+    )
+    return s
+
+
+def get_session(force_new: bool = False) -> requests.Session:
+    global _SESSION
+    with _LOCK:
+        if force_new and _SESSION is not None:
+            try:
+                _SESSION.close()
+            except Exception:
+                pass
+            _SESSION = None
+        if _SESSION is None:
+            _SESSION = _build_session()
+        return _SESSION
+
+
+def reset_session() -> None:
+    """menu2.py의 🧹 초기화 버튼에서 함께 호출하면 좋습니다."""
+    global _SESSION
+    with _LOCK:
+        if _SESSION is not None:
+            try:
+                _SESSION.close()
+            except Exception:
+                pass
+        _SESSION = None
+
+
+# ─────────────────────────────────────────────────────────────
+# POST + 재시도
+# ─────────────────────────────────────────────────────────────
+def _looks_like_valid_kind_table(html: str) -> bool:
+    return ('table class="list type-00 mt10"' in html) or ("list type-00 mt10" in html)
+
+
+def _post_kind(
+    payload: dict,
+    *,
+    referer: str = DETAILS_REFERER,
+    tries: int = 4,
+    timeout: int = 60,
+) -> str:
+    """
+    KIND POST. 403/429/503 또는 비정상 HTML이면 세션을 새로 만들어 백오프 재시도.
+    성공 시 HTML 문자열 반환.
+    """
+    last_err = None
+    for attempt in range(tries):
+        s = get_session(force_new=(attempt > 0))
+        headers = {**AJAX_HEADERS, "Referer": referer}
+        try:
+            _throttle()
+            r = s.post(KIND_URL, data=payload, headers=headers,
+                       timeout=timeout, verify=False)
+
+            if r.status_code in (403, 429, 503):
+                last_err = f"HTTP {r.status_code}"
+            else:
+                r.raise_for_status()
+                r.encoding = r.apparent_encoding
+                html = r.text
+                if _looks_like_valid_kind_table(html):
+                    return html
+                snippet = re.sub(r"\s+", " ", html)[:200]
+                last_err = f"정상 테이블 아님: {snippet}"
+
+        except requests.RequestException as e:
+            last_err = f"{type(e).__name__}: {e}"
+
+        # 백오프: 5s → 11s → 23s (+지터)
+        if attempt < tries - 1:
+            time.sleep((2 ** attempt) * 5 + random.uniform(0, 3))
+
+    raise RuntimeError(
+        f"KIND 요청 실패(재시도 {tries}회). 마지막 오류: {last_err}\n"
+        "→ 403이 반복되면 배포 서버 IP가 차단된 상태일 가능성이 큽니다."
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# 유틸 / 파싱
 # ─────────────────────────────────────────────────────────────
 def _date_to_str(d: str | pd.Timestamp) -> str:
     """'YYYY-MM-DD' 또는 'YYYYMMDD' 또는 pandas.Timestamp → 'YYYY-MM-DD'"""
@@ -55,9 +225,7 @@ def _date_to_str(d: str | pd.Timestamp) -> str:
 
 
 def _extract_company_cell(company_td) -> Tuple[str, List[str], str, str]:
-    """
-    회사명 셀에서 시장/플래그/회사명/종목코드 추출
-    """
+    """회사명 셀에서 시장/플래그/회사명/종목코드 추출"""
     market = ""
     flags: List[str] = []
 
@@ -96,8 +264,8 @@ def _parse_rows_html(html: str) -> List[List[str]]:
     table = soup.find("table", class_="list type-00 mt10")
     if not table or not table.tbody:
         return []
-    out: List[List[str]] = []
 
+    out: List[List[str]] = []
     for tr in table.tbody.find_all("tr"):
         tds = tr.find_all("td")
         if len(tds) < 5:
@@ -125,8 +293,8 @@ def _parse_rows_html(html: str) -> List[List[str]]:
         viewer = f"{VIEWER_BASE.format(docno=docno)}#{title}" if docno else ""
         submitter = tds[4].get_text(strip=True)
 
-        out.append([no, ts, market, ",".join(flags), company_name, code_num, title, docno, viewer, submitter])
-
+        out.append([no, ts, market, ",".join(flags), company_name,
+                    code_num, title, docno, viewer, submitter])
     return out
 
 
@@ -134,9 +302,11 @@ def _make_df(rows: List[List[str]]) -> pd.DataFrame:
     """rows → DF, 문서번호 중복 제거 + 시간 내림차순 + 스팩 제외"""
     if not rows:
         return pd.DataFrame()
+
     df = pd.DataFrame(
         rows,
-        columns=["번호","시간","시장","플래그","회사명","종목코드","공시제목","문서번호","뷰어URL","제출인"]
+        columns=["번호", "시간", "시장", "플래그", "회사명", "종목코드",
+                 "공시제목", "문서번호", "뷰어URL", "제출인"]
     )
     if "문서번호" in df.columns:
         df = df.drop_duplicates(subset=["문서번호"], keep="first")
@@ -149,11 +319,6 @@ def _make_df(rows: List[List[str]]) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def _looks_like_valid_kind_table(html: str) -> bool:
-    # 정상 응답이면 보통 아래 테이블이 존재
-    return ('table class="list type-00 mt10"' in html) or ("list type-00 mt10" in html)
-
-
 # ─────────────────────────────────────────────────────────────
 # 공통 상세검색 (카테고리 1~4/6)
 # ─────────────────────────────────────────────────────────────
@@ -164,35 +329,19 @@ def _kind_disclosure_search(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 5,
-    timeout: int = 300,
-    verify_ssl: bool = False,
-    session: Optional[requests.Session] = None,
+    sleep: float = 3,
     report_nm: Optional[str] = None,
     report_cd: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     KIND 상세검색(카테고리) 페이지네이션 수집.
     반환 컬럼:
-    [페이지, 번호, 시간, 시장, 플래그, 회사명, 종목코드, 공시제목, 문서번호, 뷰어URL, 제출인]
+      [페이지, 번호, 시간, 시장, 플래그, 회사명, 종목코드, 공시제목, 문서번호, 뷰어URL, 제출인]
     """
-    BASE = "https://kind.krx.co.kr"
-    GET_URL = f"{BASE}/disclosure/details.do"
-    POST_URL = f"{BASE}/disclosure/details.do"
-
     f = _date_to_str(from_date)
     t = _date_to_str(to_date)
 
-    base_headers = {"User-Agent": UA, "Accept": "text/html, */*; q=0.01"}
-    ajax_headers = {
-        **base_headers,
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "Origin": "https://kind.krx.co.kr",
-        "Referer": f"{GET_URL}?method=searchDetailsMain&disclosureType=02&disTypevalue={code}",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-
-    warm_params = {"method": "searchDetailsMain", "disclosureType": "02", "disTypevalue": code}
+    referer = f"{KIND_URL}?method=searchDetailsMain&disclosureType=02&disTypevalue={code}"
 
     data = {
         "method": "searchDetailsSub",
@@ -210,58 +359,36 @@ def _kind_disclosure_search(
         "reportNmTemp": report_nm or "",
         "reportNmPop": report_nm or "",
         "reportCd": (str(report_cd) if report_cd is not None else ""),
-
         # 나머지 공란(원형 유지)
-        "disclosureType01": "","disclosureType03": "","disclosureType04": "","disclosureType05": "",
-        "disclosureType06": "","disclosureType07": "","disclosureType08": "","disclosureType09": "",
-        "disclosureType10": "","disclosureType11": "","disclosureType13": "","disclosureType14": "",
-        "disclosureType20": "","pDisclosureType01": "","pDisclosureType03": "","pDisclosureType04": "",
-        "pDisclosureType05": "","pDisclosureType06": "","pDisclosureType07": "","pDisclosureType08": "",
-        "pDisclosureType09": "","pDisclosureType10": "","pDisclosureType11": "","pDisclosureType13": "",
-        "pDisclosureType14": "","pDisclosureType20": "","searchCodeType": "","repIsuSrtCd": "",
-        "allRepIsuSrtCd": "","oldSearchCorpName": "","searchCorpName": "",
-        "business": "","marketType": "","settlementMonth": "","securities": "","submitOblgNm": "",
+        "disclosureType01": "", "disclosureType03": "", "disclosureType04": "", "disclosureType05": "",
+        "disclosureType06": "", "disclosureType07": "", "disclosureType08": "", "disclosureType09": "",
+        "disclosureType10": "", "disclosureType11": "", "disclosureType13": "", "disclosureType14": "",
+        "disclosureType20": "", "pDisclosureType01": "", "pDisclosureType03": "", "pDisclosureType04": "",
+        "pDisclosureType05": "", "pDisclosureType06": "", "pDisclosureType07": "", "pDisclosureType08": "",
+        "pDisclosureType09": "", "pDisclosureType10": "", "pDisclosureType11": "", "pDisclosureType13": "",
+        "pDisclosureType14": "", "pDisclosureType20": "", "searchCodeType": "", "repIsuSrtCd": "",
+        "allRepIsuSrtCd": "", "oldSearchCorpName": "", "searchCorpName": "",
+        "business": "", "marketType": "", "settlementMonth": "", "securities": "", "submitOblgNm": "",
         "enterprise": "",
     }
 
-    cols = ["페이지","번호","시간","시장","플래그","회사명","종목코드","공시제목","문서번호","뷰어URL","제출인"]
+    cols = ["페이지", "번호", "시간", "시장", "플래그", "회사명", "종목코드",
+            "공시제목", "문서번호", "뷰어URL", "제출인"]
     rows: List[List[str]] = []
 
-    close_after = False
-    s = session
-    if s is None:
-        s = requests.Session()
-        close_after = True
+    for page in range(1, max_pages + 1):
+        data["pageIndex"] = str(page)
+        html = _post_kind(data, referer=referer)
 
-    try:
-        s.headers.update(base_headers)
-        s.get(GET_URL, params=warm_params, timeout=timeout, verify=False)
+        added = 0
+        for row in _parse_rows_html(html):
+            rows.append([page] + row)
+            added += 1
 
-        for page in range(1, max_pages + 1):
-            data["pageIndex"] = str(page)
-            r = s.post(POST_URL, data=data, headers=ajax_headers, timeout=timeout, verify=False)
-            r.raise_for_status()
-            r.encoding = r.apparent_encoding
-            html = r.text
-
-            # ✅ 200 OK 차단/오류 HTML도 여기서 걸러서 "캐싱"을 방지
-            if not _looks_like_valid_kind_table(html):
-                snippet = re.sub(r"\s+", " ", html)[:300]
-                raise RuntimeError(f"KIND 응답이 정상 테이블이 아님(차단/오류 가능). 응답 일부: {snippet}")
-
-            added = 0
-            for row in _parse_rows_html(html):
-                rows.append([page] + row)
-                added += 1
-
-            if added == 0 or added < int(page_size):
-                break
-            if sleep:
-                time.sleep(sleep)
-
-    finally:
-        if close_after:
-            s.close()
+        if added == 0 or added < int(page_size):
+            break
+        if sleep:
+            time.sleep(sleep + random.uniform(0, 1))
 
     df = pd.DataFrame(rows, columns=cols)
     if not df.empty and "회사명" in df.columns:
@@ -291,55 +418,46 @@ def kind_fetch(
 
 
 # ─────────────────────────────────────────────────────────────
-# 투자경고·위험 / 단기과열 / 시장감시위원회 (warn 페이로드)
+# 투자경고·위험 / 단기과열 / 시장감시위원회 / 상장폐지 (warn 페이로드)
 # ─────────────────────────────────────────────────────────────
-HEADERS_MENU_WARN = {
-    "User-Agent": UA,
-    "Accept": "text/html, */*; q=0.01",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    "Origin": "https://kind.krx.co.kr",
-    "Referer": "https://kind.krx.co.kr/disclosure/details.do?method=searchDetailsMain",
-    "X-Requested-With": "XMLHttpRequest",
-}
 BASE_PAYLOAD_WARN = {
-    "method":"searchDetailsSub","currentPageSize":"15","pageIndex":"1",
-    "orderMode":"1","orderStat":"D","forward":"details_sub",
-    "disclosureType01":"","disclosureType02":"","disclosureType03":"","disclosureType04":"",
-    "disclosureType05":"","disclosureType06":"","disclosureType07":"","disclosureType08":"",
-    "disclosureType09":"","disclosureType10":"","disclosureType11":"","disclosureType13":"",
-    "disclosureType14":"","disclosureType20":"",
-    "pDisclosureType01":"","pDisclosureType02":"","pDisclosureType03":"","pDisclosureType04":"",
-    "pDisclosureType05":"","pDisclosureType06":"","pDisclosureType07":"","pDisclosureType08":"",
-    "pDisclosureType09":"","pDisclosureType10":"","pDisclosureType11":"","pDisclosureType13":"",
-    "pDisclosureType14":"","pDisclosureType20":"",
-    "searchCodeType":"","repIsuSrtCd":"","allRepIsuSrtCd":"","oldSearchCorpName":"",
-    "disclosureType":"","disTypevalue":"",
-    "searchCorpName":"","business":"","marketType":"","settlementMonth":"",
-    "securities":"","submitOblgNm":"","enterprise":"",
-    "bfrDsclsType":"on",
+    "method": "searchDetailsSub", "currentPageSize": "15", "pageIndex": "1",
+    "orderMode": "1", "orderStat": "D", "forward": "details_sub",
+    "disclosureType01": "", "disclosureType02": "", "disclosureType03": "", "disclosureType04": "",
+    "disclosureType05": "", "disclosureType06": "", "disclosureType07": "", "disclosureType08": "",
+    "disclosureType09": "", "disclosureType10": "", "disclosureType11": "", "disclosureType13": "",
+    "disclosureType14": "", "disclosureType20": "",
+    "pDisclosureType01": "", "pDisclosureType02": "", "pDisclosureType03": "", "pDisclosureType04": "",
+    "pDisclosureType05": "", "pDisclosureType06": "", "pDisclosureType07": "", "pDisclosureType08": "",
+    "pDisclosureType09": "", "pDisclosureType10": "", "pDisclosureType11": "", "pDisclosureType13": "",
+    "pDisclosureType14": "", "pDisclosureType20": "",
+    "searchCodeType": "", "repIsuSrtCd": "", "allRepIsuSrtCd": "", "oldSearchCorpName": "",
+    "disclosureType": "", "disTypevalue": "",
+    "searchCorpName": "", "business": "", "marketType": "", "settlementMonth": "",
+    "securities": "", "submitOblgNm": "", "enterprise": "",
+    "bfrDsclsType": "on",
 }
 
-TARGETS_WARN: List[Tuple[str,str,str,str]] = [
-    ("투자경고종목지정",         "68809", "투자경고종목 지정",              "투자경고종목 지정"),
-    ("투자경고종목지정",         "70804", "투자경고종목지정",                "투자경고종목지정"),
-    ("투자경고종목지정(재지정)", "68823", "투자경고종목 지정(재지정)",       "투자경고종목 지정(재지정)"),
-    ("투자경고종목지정(재지정)", "72049", "투자경고종목지정(재지정)",         "투자경고종목지정(재지정)"),
-    ("투자경고종목지정해제",     "68824", "투자경고종목 지정해제",           "투자경고종목 지정해제"),
-    ("투자경고종목지정해제",     "72056", "투자경고종목 지정해제",           "투자경고종목 지정해제"),
+TARGETS_WARN: List[Tuple[str, str, str, str]] = [
+    ("투자경고종목지정", "68809", "투자경고종목 지정", "투자경고종목 지정"),
+    ("투자경고종목지정", "70804", "투자경고종목지정", "투자경고종목지정"),
+    ("투자경고종목지정(재지정)", "68823", "투자경고종목 지정(재지정)", "투자경고종목 지정(재지정)"),
+    ("투자경고종목지정(재지정)", "72049", "투자경고종목지정(재지정)", "투자경고종목지정(재지정)"),
+    ("투자경고종목지정해제", "68824", "투자경고종목 지정해제", "투자경고종목 지정해제"),
+    ("투자경고종목지정해제", "72056", "투자경고종목 지정해제", "투자경고종목 지정해제"),
     ("[투자주의]투자경고종목지정해제및재지정예고", "70820",
      "[투자주의]투자경고종목 지정해제 및 재지정 예고",
      "[투자주의]투자경고종목 지정해제 및 재지정 예고"),
     ("[투자주의]투자경고종목지정해제및재지정예고", "68810",
      "[투자주의]투자경고종목 지정해제 및 재지정 예고",
      "[투자주의]투자경고종목 지정해제 및 재지정 예고"),
-    ("투자위험종목지정",         "68812", "투자위험종목지정",                "투자위험종목지정"),
-    ("투자위험종목지정",         "70832", "투자위험종목지정",                "투자위험종목지정"),
-    ("투자위험종목지정해제",     "68813", "투자위험종목지정해제",            "투자위험종목지정해제"),
-    ("투자위험종목지정해제",     "70834", "투자위험종목지정해제",            "투자위험종목지정해제"),
+    ("투자위험종목지정", "68812", "투자위험종목지정", "투자위험종목지정"),
+    ("투자위험종목지정", "70832", "투자위험종목지정", "투자위험종목지정"),
+    ("투자위험종목지정해제", "68813", "투자위험종목지정해제", "투자위험종목지정해제"),
+    ("투자위험종목지정해제", "70834", "투자위험종목지정해제", "투자위험종목지정해제"),
 ]
 
-# ✅ "시장감시위원회" 메뉴에서 보여줄 reportCd 세트 (사용자 제공)
-TARGETS_MARKET_WATCH: List[Tuple[str,str,str,str]] = [
+TARGETS_MARKET_WATCH: List[Tuple[str, str, str, str]] = [
     # [유가증권]
     ("기타시장안내(단기과열완화장치발동예고)", "99432",
      "기타시장안내 (단기과열완화장치 발동예고)", "기타시장안내 (단기과열완화장치 발동예고)"),
@@ -356,16 +474,20 @@ TARGETS_MARKET_WATCH: List[Tuple[str,str,str,str]] = [
     ("장애종목매매거래정지시장안내(유가증권시장)", "99457",
      "장애종목 매매거래정지 시장안내 (유가증권시장)", "장애종목 매매거래정지 시장안내 (유가증권시장)"),
     ("장애종목매매거래재개시장안내(유가증권시장/접속매매방식재개)", "99458",
-     "장애종목 매매거래재개 시장안내 (유가증권시장 / 접속매매 방식 재개)", "장애종목 매매거래재개 시장안내 (유가증권시장 / 접속매매 방식 재개)"),
+     "장애종목 매매거래재개 시장안내 (유가증권시장 / 접속매매 방식 재개)",
+     "장애종목 매매거래재개 시장안내 (유가증권시장 / 접속매매 방식 재개)"),
     ("장애종목매매거래재개시장안내(유가증권시장/종가단일가매매방식재개)", "99459",
-     "장애종목 매매거래재개 시장안내 (유가증권시장 / 종가단일가매매 방식 재개)", "장애종목 매매거래재개 시장안내 (유가증권시장 / 종가단일가매매 방식 재개)"),
+     "장애종목 매매거래재개 시장안내 (유가증권시장 / 종가단일가매매 방식 재개)",
+     "장애종목 매매거래재개 시장안내 (유가증권시장 / 종가단일가매매 방식 재개)"),
     ("장애종목매매거래재개시장안내(유가증권시장/시간외단일가매매방식재개)", "99462",
-     "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외단일가매매 방식 재개)", "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외단일가매매 방식 재개)"),
+     "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외단일가매매 방식 재개)",
+     "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외단일가매매 방식 재개)"),
     ("장애종목매매거래재개시장안내(유가증권시장/시간외종가매매방식재개)", "99461",
-     "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외종가매매 방식 재개)", "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외종가매매 방식 재개)"),
+     "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외종가매매 방식 재개)",
+     "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외종가매매 방식 재개)"),
     ("장애종목매매거래재개시장안내(유가증권시장/시간외종가매매호가접수시간대재개)", "99460",
-     "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외종가매매 호가접수시간대 재개)", "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외종가매매 호가접수시간대 재개)"),
-
+     "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외종가매매 호가접수시간대 재개)",
+     "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외종가매매 호가접수시간대 재개)"),
     # [코스닥]
     ("기타시장안내(단기과열완화장치발동예고)", "70729",
      "기타시장안내 (단기과열완화장치 발동예고)", "기타시장안내 (단기과열완화장치 발동예고)"),
@@ -380,21 +502,23 @@ TARGETS_MARKET_WATCH: List[Tuple[str,str,str,str]] = [
     ("장애종목매매거래정지시장안내(코스닥시장)", "72116",
      "장애종목 매매거래정지 시장안내 (코스닥시장)", "장애종목 매매거래정지 시장안내 (코스닥시장)"),
     ("장애종목매매거래재개시장안내(코스닥시장/접속매매방식재개)", "72117",
-     "장애종목 매매거래재개 시장안내 (코스닥시장 / 접속매매 방식 재개)", "장애종목 매매거래재개 시장안내 (코스닥시장 / 접속매매 방식 재개)"),
+     "장애종목 매매거래재개 시장안내 (코스닥시장 / 접속매매 방식 재개)",
+     "장애종목 매매거래재개 시장안내 (코스닥시장 / 접속매매 방식 재개)"),
     ("장애종목매매거래재개시장안내(코스닥시장/종가단일가매매방식재개)", "72118",
-     "장애종목 매매거래재개 시장안내 (코스닥시장 / 종가단일가매매 방식 재개)", "장애종목 매매거래재개 시장안내 (코스닥시장 / 종가단일가매매 방식 재개)"),
+     "장애종목 매매거래재개 시장안내 (코스닥시장 / 종가단일가매매 방식 재개)",
+     "장애종목 매매거래재개 시장안내 (코스닥시장 / 종가단일가매매 방식 재개)"),
     ("장애종목매매거래재개시장안내(코스닥시장/시간외단일가매매방식재개)", "72121",
-     "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외단일가매매 방식 재개)", "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외단일가매매 방식 재개)"),
+     "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외단일가매매 방식 재개)",
+     "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외단일가매매 방식 재개)"),
     ("장애종목매매거래재개시장안내(코스닥시장/시간외종가매매방식재개)", "72120",
-     "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외종가매매 방식 재개)", "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외종가매매 방식 재개)"),
+     "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외종가매매 방식 재개)",
+     "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외종가매매 방식 재개)"),
     ("장애종목매매거래재개시장안내(코스닥시장/시간외종가매매호가접수시간대재개)", "72119",
-     "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외종가매매 호가접수시간대 재개)", "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외종가매매 호가접수시간대 재개)"),
+     "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외종가매매 호가접수시간대 재개)",
+     "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외종가매매 호가접수시간대 재개)"),
 ]
 
-# ─────────────────────────────────────────────────────────────
-# ✅ 상장폐지 reportCd 세트 (유가증권 68051 / 코스닥 70769)
-# ─────────────────────────────────────────────────────────────
-TARGETS_DELIST: List[Tuple[str,str,str,str]] = [
+TARGETS_DELIST: List[Tuple[str, str, str, str]] = [
     ("상장폐지", "68051", "상장폐지", "상장폐지"),   # 유가증권
     ("상장폐지", "70769", "상장폐지", "상장폐지"),   # 코스닥
 ]
@@ -403,60 +527,50 @@ TARGETS_DELIST: List[Tuple[str,str,str,str]] = [
 def _fetch_reportcd_with_warn_payload(
     from_date: str,
     to_date: str,
-    targets: List[Tuple[str,str,str,str]],
+    targets: List[Tuple[str, str, str, str]],
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 5,
+    sleep: float = 3,
 ) -> pd.DataFrame:
     f = _date_to_str(from_date)
     t = _date_to_str(to_date)
-
     rows: List[List[str]] = []
-    with requests.Session() as s:
-        s.headers.update(HEADERS_MENU_WARN)
 
-        for nm, cd, nm_temp, nm_pop in targets:
-            for page in range(1, max_pages + 1):
-                payload = {
-                    **BASE_PAYLOAD_WARN,
-                    "currentPageSize": str(page_size),
-                    "pageIndex": str(page),
-                    "fromDate": f,
-                    "toDate": t,
-                    "reportNm": nm,
-                    "reportCd": cd,
-                    "reportNmTemp": nm_temp,
-                    "reportNmPop": nm_pop,
-                }
-                r = s.post(KIND_URL, data=payload, timeout=300, verify=False)
-                r.raise_for_status()
-                html = r.text
+    for idx, (nm, cd, nm_temp, nm_pop) in enumerate(targets):
+        # ✅ reportCd 사이에도 반드시 쉬어간다 (기존 버그: break로 sleep을 건너뜀)
+        if idx > 0 and sleep:
+            time.sleep(sleep + random.uniform(0, 1))
 
-                # ✅ 200 OK 차단/오류 HTML도 여기서 걸러서 "캐싱"을 방지
-                if not _looks_like_valid_kind_table(html):
-                    snippet = re.sub(r"\s+", " ", html)[:300]
-                    raise RuntimeError(f"KIND(warn payload) 응답이 정상 테이블이 아님(차단/오류 가능). 응답 일부: {snippet}")
+        for page in range(1, max_pages + 1):
+            payload = {
+                **BASE_PAYLOAD_WARN,
+                "currentPageSize": str(page_size),
+                "pageIndex": str(page),
+                "fromDate": f,
+                "toDate": t,
+                "reportNm": nm,
+                "reportCd": cd,
+                "reportNmTemp": nm_temp,
+                "reportNmPop": nm_pop,
+            }
+            html = _post_kind(payload)
 
-                before = len(rows)
-                rows += _parse_rows_html(html)
-                added = len(rows) - before
+            before = len(rows)
+            rows += _parse_rows_html(html)
+            added = len(rows) - before
 
-                if added == 0 or added < int(page_size):
-                    break
-                if sleep:
-                    time.sleep(sleep)
+            if added == 0 or added < int(page_size):
+                break
+            if sleep:
+                time.sleep(sleep + random.uniform(0, 1))
 
     return _make_df(rows)
 
 
 def fetch_investor_warning(
-    from_date: str,
-    to_date: str,
-    *,
-    page_size: int = 100,
-    max_pages: int = 1000,
-    sleep: float = 5,
+    from_date: str, to_date: str, *,
+    page_size: int = 100, max_pages: int = 1000, sleep: float = 3,
 ) -> pd.DataFrame:
     """투자경고·위험: 여러 reportCd × 페이지네이션 전체 수집 → 문서번호 중복 제거."""
     return _fetch_reportcd_with_warn_payload(
@@ -466,62 +580,45 @@ def fetch_investor_warning(
 
 
 def fetch_shortterm_overheat(
-    from_date: str,
-    to_date: str,
-    *,
-    page_size: int = 100,
-    max_pages: int = 1000,
-    sleep: float = 5,
+    from_date: str, to_date: str, *,
+    page_size: int = 100, max_pages: int = 1000, sleep: float = 3,
 ) -> pd.DataFrame:
     """단기과열: reportNm='단기과열' 단일 조건 페이지네이션 수집."""
     f = _date_to_str(from_date)
     t = _date_to_str(to_date)
-
     rows: List[List[str]] = []
-    with requests.Session() as s:
-        s.headers.update(HEADERS_MENU_WARN)
 
-        for page in range(1, max_pages + 1):
-            payload = {
-                **BASE_PAYLOAD_WARN,
-                "currentPageSize": str(page_size),
-                "pageIndex": str(page),
-                "fromDate": f,
-                "toDate": t,
-                "reportNm": "단기과열",
-                "reportCd": "",
-                "reportNmTemp": "단기과열",
-                "reportNmPop": "",
-            }
-            r = s.post(KIND_URL, data=payload, timeout=300, verify=False)
-            r.raise_for_status()
-            html = r.text
+    for page in range(1, max_pages + 1):
+        payload = {
+            **BASE_PAYLOAD_WARN,
+            "currentPageSize": str(page_size),
+            "pageIndex": str(page),
+            "fromDate": f,
+            "toDate": t,
+            "reportNm": "단기과열",
+            "reportCd": "",
+            "reportNmTemp": "단기과열",
+            "reportNmPop": "",
+        }
+        html = _post_kind(payload)
 
-            if not _looks_like_valid_kind_table(html):
-                snippet = re.sub(r"\s+", " ", html)[:300]
-                raise RuntimeError(f"KIND(단기과열) 응답이 정상 테이블이 아님(차단/오류 가능). 응답 일부: {snippet}")
+        before = len(rows)
+        rows += _parse_rows_html(html)
+        added = len(rows) - before
 
-            before = len(rows)
-            rows += _parse_rows_html(html)
-            added = len(rows) - before
-
-            if added == 0 or added < int(page_size):
-                break
-            if sleep:
-                time.sleep(sleep)
+        if added == 0 or added < int(page_size):
+            break
+        if sleep:
+            time.sleep(sleep + random.uniform(0, 1))
 
     return _make_df(rows)
 
 
 def fetch_market_watch(
-    from_date: str,
-    to_date: str,
-    *,
-    page_size: int = 100,
-    max_pages: int = 1000,
-    sleep: float = 5,
+    from_date: str, to_date: str, *,
+    page_size: int = 100, max_pages: int = 1000, sleep: float = 3,
 ) -> pd.DataFrame:
-    """시장감시위원회(사용자 지정): 사용자가 준 reportCd 목록을 warn 페이로드 방식으로 조회."""
+    """시장감시위원회: reportCd 목록을 warn 페이로드 방식으로 조회."""
     return _fetch_reportcd_with_warn_payload(
         from_date, to_date, TARGETS_MARKET_WATCH,
         page_size=page_size, max_pages=max_pages, sleep=sleep
@@ -529,15 +626,69 @@ def fetch_market_watch(
 
 
 def fetch_delist(
-    from_date: str,
-    to_date: str,
-    *,
-    page_size: int = 100,
-    max_pages: int = 1000,
-    sleep: float = 5,
+    from_date: str, to_date: str, *,
+    page_size: int = 100, max_pages: int = 1000, sleep: float = 3,
 ) -> pd.DataFrame:
-    """상장폐지: 유가증권(68051) + 코스닥(70769) reportCd를 warn 페이로드 방식으로 조회."""
+    """상장폐지: 유가증권(68051) + 코스닥(70769)."""
     return _fetch_reportcd_with_warn_payload(
         from_date, to_date, TARGETS_DELIST,
         page_size=page_size, max_pages=max_pages, sleep=sleep
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# 진단용 — 배포 환경에서 어디서 막히는지 확인
+# ─────────────────────────────────────────────────────────────
+def diagnose(timeout: int = 20) -> dict:
+    """
+    menu2.py에서:
+        import fnc2; st.json(fnc2.diagnose())
+    로 호출해 배포 서버에서 어느 단계가 막히는지 확인.
+    """
+    out = {}
+    s = requests.Session()
+    s.headers.update(NAV_HEADERS)
+
+    for label, url, params in [
+        ("main_get", MAIN_URL, {"method": "loadInitPage"}),
+        ("details_get", KIND_URL, {"method": "searchDetailsMain"}),
+    ]:
+        try:
+            r = s.get(url, params=params, timeout=timeout, verify=False)
+            out[label] = {"status": r.status_code, "len": len(r.text)}
+        except Exception as e:
+            out[label] = {"error": f"{type(e).__name__}: {e}"}
+
+    out["cookies"] = {k: v[:8] + "..." for k, v in s.cookies.get_dict().items()}
+
+    # 최소 POST 1회
+    try:
+        payload = {
+            **BASE_PAYLOAD_WARN,
+            "currentPageSize": "15", "pageIndex": "1",
+            "fromDate": "2026-07-01", "toDate": "2026-07-31",
+            "reportNm": "상장폐지", "reportCd": "68051",
+            "reportNmTemp": "상장폐지", "reportNmPop": "상장폐지",
+        }
+        r = s.post(KIND_URL, data=payload,
+                   headers={**AJAX_HEADERS, "Referer": DETAILS_REFERER},
+                   timeout=timeout, verify=False)
+        out["details_post"] = {
+            "status": r.status_code,
+            "len": len(r.text),
+            "valid_table": _looks_like_valid_kind_table(r.text),
+            "snippet": re.sub(r"\s+", " ", r.text)[:200],
+        }
+    except Exception as e:
+        out["details_post"] = {"error": f"{type(e).__name__}: {e}"}
+
+    # 비교군: data.krx.co.kr 도 막히는지 (= IP 차단 여부 판별)
+    try:
+        r = s.get("https://data.krx.co.kr/contents/MDC/MAIN/main/index.cmd",
+                  timeout=timeout, verify=False)
+        out["data_krx_get"] = {"status": r.status_code, "len": len(r.text)}
+    except Exception as e:
+        out["data_krx_get"] = {"error": f"{type(e).__name__}: {e}"}
+
+    s.close()
+    return out
