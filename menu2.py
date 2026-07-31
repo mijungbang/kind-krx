@@ -31,10 +31,6 @@ except Exception:
     def _kind_pacer_status():
         return {"delay": 0}
 
-try:
-    from fnc2 import MAX_INFLIGHT
-except Exception:
-    MAX_INFLIGHT = 1
 
 # NXT 종목 조회 (환경에 따라 없을 수 있으므로 안전 처리)
 try:
@@ -178,17 +174,68 @@ class ProgressUI:
     """
     steps: [(라벨, 요청수), ...]
     상태: pending → running → done / failed
-    전체 진행률은 '요청 수' 기준이라 24개짜리 소스가 오래 걸려도 막대가 자연스럽게 움직인다.
+    진행률은 '소스 개수'가 아니라 '요청 수' 기준이라 23개짜리 소스에서도 막대가 계속 움직인다.
     """
 
-    ICON = {"pending": "·", "running": "▶", "done": "✓", "failed": "✕"}
+    CSS = """
+<style>
+@keyframes kp-pulse {
+  0%,100% { transform: scale(1);   opacity: 1; }
+  50%     { transform: scale(1.45); opacity: .45; }
+}
+@keyframes kp-shimmer {
+  0%   { background-position: -220px 0; }
+  100% { background-position: 220px 0; }
+}
+.kp-card{
+  border:1px solid rgba(128,128,128,.22); border-radius:14px;
+  padding:16px 18px 14px; margin:2px 0 10px;
+  background:rgba(128,128,128,.045);
+}
+.kp-top{ display:flex; justify-content:space-between; align-items:baseline; margin-bottom:11px; }
+.kp-now{ font-size:.95rem; font-weight:650; letter-spacing:-.2px; }
+.kp-meta{ font-size:.76rem; opacity:.55; font-variant-numeric:tabular-nums; }
+.kp-track{
+  height:6px; border-radius:99px; background:rgba(128,128,128,.18);
+  overflow:hidden; margin-bottom:14px;
+}
+.kp-fill{
+  height:100%; border-radius:99px;
+  background:linear-gradient(90deg,#3b82f6,#22c55e);
+  transition:width .4s cubic-bezier(.4,0,.2,1);
+}
+.kp-fill.kp-live{
+  background-image:linear-gradient(90deg,#3b82f6,#60a5fa,#22c55e,#3b82f6);
+  background-size:220px 100%;
+  animation:kp-shimmer 1.3s linear infinite;
+}
+.kp-grid{ display:flex; flex-direction:column; gap:1px; }
+.kp-row{
+  display:flex; align-items:center; gap:9px;
+  padding:4px 2px; font-size:.83rem; line-height:1.35;
+}
+.kp-dot{ width:7px; height:7px; border-radius:50%; flex:0 0 7px; }
+.kp-row.pending .kp-dot{ background:rgba(128,128,128,.35); }
+.kp-row.running .kp-dot{ background:#3b82f6; animation:kp-pulse 1s ease-in-out infinite; }
+.kp-row.done    .kp-dot{ background:#22c55e; }
+.kp-row.failed  .kp-dot{ background:#ef4444; }
+.kp-row.pending .kp-label{ opacity:.42; }
+.kp-row.running .kp-label{ font-weight:650; }
+.kp-row.failed  .kp-label{ color:#ef4444; }
+.kp-label{ flex:1 1 auto; }
+.kp-tag{
+  font-size:.72rem; opacity:.6; font-variant-numeric:tabular-nums;
+  padding:1px 7px; border-radius:99px; background:rgba(128,128,128,.14);
+}
+.kp-row.failed .kp-tag{ background:rgba(239,68,68,.14); color:#ef4444; opacity:1; }
+</style>
+"""
 
     def __init__(self, steps):
         self.steps = [{"label": l, "units": u, "state": "pending",
                        "done_units": 0, "note": ""} for l, u in steps]
         self.total = sum(u for _, u in steps) or 1
         self.t0 = time.time()
-        self.bar = st.progress(0.0, text="KIND 접속 준비 중...")
         self.box = st.empty()
         self._render()
 
@@ -198,50 +245,52 @@ class ProgressUI:
                 return i
         return None
 
-    def _completed_units(self):
+    def _done_units(self):
         return sum(
             s["units"] if s["state"] in ("done", "failed") else s["done_units"]
             for s in self.steps
         )
 
     def _render(self, current=""):
-        done_u = self._completed_units()
-        frac = min(done_u / self.total, 1.0)
+        done_u = self._done_units()
+        pct = min(done_u / self.total, 1.0) * 100
         el = time.time() - self.t0
+        running = any(s["state"] == "running" for s in self.steps)
 
-        head = f"{done_u}/{self.total} 요청 · {el:.0f}초"
-        if current:
-            head = f"{current} · {head}"
-        try:
-            self.bar.progress(frac, text=head)
-        except Exception:
-            pass
+        headline = current or ("완료" if not running else "수집 중")
+        live = " kp-live" if running else ""
 
-        lines = []
+        rows = []
         for s in self.steps:
-            icon = self.ICON[s["state"]]
-            label = s["label"]
-            if s["state"] == "running" and s["units"] > 1:
-                detail = f" ({s['done_units']}/{s['units']})"
-            elif s["state"] == "done":
-                detail = f" — {s['note']}" if s["note"] else ""
-            elif s["state"] == "failed":
-                detail = " — 실패"
+            state = s["state"]
+            if state == "running" and s["units"] > 1:
+                tag = f"{s['done_units']}/{s['units']}"
+            elif state == "running":
+                tag = "조회 중"
+            elif state == "done":
+                tag = s["note"] or "완료"
+            elif state == "failed":
+                tag = "실패"
             else:
-                detail = ""
-
-            if s["state"] == "pending":
-                lines.append(f"<span style='color:#aaa'>{icon} {label}{detail}</span>")
-            elif s["state"] == "failed":
-                lines.append(f"<span style='color:#c0392b'>{icon} {label}{detail}</span>")
-            elif s["state"] == "running":
-                lines.append(f"<span style='color:#1f6feb;font-weight:600'>{icon} {label}{detail}</span>")
-            else:
-                lines.append(f"<span style='color:#2e7d32'>{icon} {label}{detail}</span>")
+                tag = ""
+            tag_html = f'<span class="kp-tag">{escape(tag)}</span>' if tag else ""
+            rows.append(
+                f'<div class="kp-row {state}">'
+                f'<span class="kp-dot"></span>'
+                f'<span class="kp-label">{escape(s["label"])}</span>'
+                f'{tag_html}</div>'
+            )
 
         self.box.markdown(
-            "<div style='font-size:0.82rem; line-height:1.7; font-family:ui-monospace,monospace'>"
-            + "<br>".join(lines) + "</div>",
+            self.CSS
+            + '<div class="kp-card">'
+            + '<div class="kp-top">'
+            + f'<span class="kp-now">{escape(headline)}</span>'
+            + f'<span class="kp-meta">{done_u}/{self.total} · {el:.0f}s</span>'
+            + '</div>'
+            + f'<div class="kp-track"><div class="kp-fill{live}" style="width:{pct:.1f}%"></div></div>'
+            + '<div class="kp-grid">' + "".join(rows) + '</div>'
+            + '</div>',
             unsafe_allow_html=True,
         )
 
@@ -274,7 +323,6 @@ class ProgressUI:
 
     def clear(self):
         try:
-            self.bar.empty()
             self.box.empty()
         except Exception:
             pass
@@ -484,11 +532,6 @@ def run():
             label_visibility="collapsed",
         )
         st.markdown("</div>", unsafe_allow_html=True)
-
-        # 예상 소요시간 안내 (병렬 수집 기준. 차단이 걸리면 자동으로 느려짐)
-        n_req = sum(u for _, u in plan_steps(menu_key))
-        if n_req >= 10:
-            st.caption(f"⏱ KIND 요청 {n_req}회 · 최대 {MAX_INFLIGHT}개 동시 · 정상 시 5~15초")
 
         st.markdown("---")
 
