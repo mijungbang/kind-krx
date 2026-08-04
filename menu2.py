@@ -43,7 +43,7 @@ except Exception:
 # ─────────────────────────────────────────────────────────────
 # 상수/유틸
 # ─────────────────────────────────────────────────────────────
-HALT_PATTERN = re.compile(r"(매매)?거래정지|정지해제|거래정지해제|거래정지기간", re.IGNORECASE)
+HALT_PATTERN = re.compile(r"(?:매매)?거래정지|정지해제|거래정지해제|거래정지기간", re.IGNORECASE)
 INV_SUFFIX_EXCLUDE = re.compile(r"\((?:[^)]*우B?)\)\s*$")
 
 OVERHEAT_PATTERN = re.compile(r"단기과열", re.IGNORECASE)
