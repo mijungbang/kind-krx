@@ -1,9 +1,13 @@
-streamlit>=1.35.0
-openpyxl>=3.1.2
-pandas>=2.2.2
-requests>=2.31.0
-beautifulsoup4>=4.12.3
-urllib3>=2.2.1
-streamlit-tree-select
-lxml
-ipaddress
+# 2026-08-02 배포에서 실제로 해석된 버전으로 고정
+# (재배포 시 pandas/numpy 메이저 업그레이드로 조용히 깨지는 것 방지)
+streamlit==1.60.0
+pandas==3.0.5
+numpy==2.5.1
+requests==2.34.2
+beautifulsoup4==4.15.0
+soupsieve==2.9.1
+
+# 제외한 것:
+#   ipaddress==1.0.23   → Python 2.6~3.2용 백포트. 3.12에서는 표준 라이브러리를 가릴 수 있음
+#   streamlit-tree-select, openpyxl, lxml → 현재 코드에서 미사용
+#   (실제로 쓰고 있다면 다시 추가하세요)
