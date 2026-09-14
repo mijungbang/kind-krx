@@ -20,7 +20,9 @@
 from __future__ import annotations
 
 import atexit
+import os
 import re
+import sys
 import time
 from typing import Optional, Dict, List, Tuple
 
@@ -89,19 +91,42 @@ class KindBrowser:
         # ── 브라우저/드라이버 자동 탐지 ──────────────────────
         # Streamlit Cloud(리눅스): packages.txt로 설치된 chromium 사용
         # 로컬 PC: 설치된 Chrome + Selenium Manager가 드라이버 자동 관리
-        chrome_bin = (
-            shutil.which("chromium")
-            or shutil.which("chromium-browser")
-            or shutil.which("google-chrome")
+        def _find(*cands):
+            for c in cands:
+                p = shutil.which(c) or (c if c.startswith("/") and os.path.exists(c) else None)
+                if p:
+                    return p
+            return None
+
+        chrome_bin = _find(
+            "chromium", "chromium-browser",
+            "/usr/bin/chromium", "/usr/bin/chromium-browser",
+            "google-chrome", "google-chrome-stable",
         )
-        driver_bin = shutil.which("chromedriver")
+        driver_bin = _find(
+            "chromedriver",
+            "/usr/bin/chromedriver",
+            "/usr/lib/chromium/chromedriver",
+            "/usr/lib/chromium-browser/chromedriver",
+        )
+
+        on_linux_cloud = sys.platform.startswith("linux")
 
         if chrome_bin and "chromium" in chrome_bin:
             opts.binary_location = chrome_bin
 
         if driver_bin:
             self.driver = webdriver.Chrome(service=Service(driver_bin), options=opts)
+        elif on_linux_cloud and not chrome_bin:
+            # Selenium Manager 폴백은 클라우드에서 status 127로 죽으므로 명확히 안내
+            raise RuntimeError(
+                "chromium/chromedriver가 설치되어 있지 않습니다. "
+                "레포 루트에 packages.txt(내용: chromium, chromium-driver 각 한 줄)를 커밋하고 "
+                "Streamlit Cloud에서 앱을 Reboot(또는 재배포)하세요. "
+                f"[탐지 결과 chrome_bin={chrome_bin}, driver_bin={driver_bin}]"
+            )
         else:
+            # 로컬 PC 등: Selenium Manager가 드라이버 자동 관리
             self.driver = webdriver.Chrome(options=opts)
         self.driver.set_page_load_timeout(page_load_timeout)
         self.driver.set_script_timeout(page_load_timeout)
