@@ -29,7 +29,9 @@ from bs4 import BeautifulSoup
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import WebDriverException
+import shutil
 
 __all__ = [
     "CODE_MAP",
@@ -84,7 +86,23 @@ class KindBrowser:
         opts.add_experimental_option("useAutomationExtension", False)
         opts.add_argument("--disable-blink-features=AutomationControlled")
 
-        self.driver = webdriver.Chrome(options=opts)
+        # ── 브라우저/드라이버 자동 탐지 ──────────────────────
+        # Streamlit Cloud(리눅스): packages.txt로 설치된 chromium 사용
+        # 로컬 PC: 설치된 Chrome + Selenium Manager가 드라이버 자동 관리
+        chrome_bin = (
+            shutil.which("chromium")
+            or shutil.which("chromium-browser")
+            or shutil.which("google-chrome")
+        )
+        driver_bin = shutil.which("chromedriver")
+
+        if chrome_bin and "chromium" in chrome_bin:
+            opts.binary_location = chrome_bin
+
+        if driver_bin:
+            self.driver = webdriver.Chrome(service=Service(driver_bin), options=opts)
+        else:
+            self.driver = webdriver.Chrome(options=opts)
         self.driver.set_page_load_timeout(page_load_timeout)
         self.driver.set_script_timeout(page_load_timeout)
 
