@@ -1,37 +1,58 @@
-# fnc2.py
-# 상장폐지 추가
+# fnc2_selenium.py
+# ─────────────────────────────────────────────────────────────
+# kind-krx의 fnc2.py를 Selenium 기반으로 전환한 버전.
+#
+# 동작 원리
+#   1) Selenium으로 실제 Chrome을 띄워 KIND 상세검색 페이지에 접속
+#      → 정상적인 쿠키 / TLS·브라우저 지문 / Referer가 자동으로 확보됨
+#   2) 그 브라우저 "안에서" JavaScript fetch로 기존과 동일한
+#      searchDetailsSub POST를 실행하고 HTML을 돌려받음
+#   3) 이후 파싱(BeautifulSoup)·DataFrame 가공은 원본 fnc2.py와 동일
+#
+# 공개 API는 원본과 동일해서 노트북/menu2.py 쪽 수정이 거의 필요 없음:
+#   kind_fetch, fetch_investor_warning, fetch_shortterm_overheat,
+#   fetch_market_watch, fetch_delist
+#
+# 필요 패키지: selenium>=4.10 (Selenium Manager가 chromedriver 자동 관리),
+#              beautifulsoup4, pandas, lxml
+#   pip install selenium beautifulsoup4 pandas lxml
+# ─────────────────────────────────────────────────────────────
 from __future__ import annotations
 
+import atexit
 import re
 import time
 from typing import Optional, Dict, List, Tuple
 
-import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import WebDriverException
+
 __all__ = [
     "CODE_MAP",
+    "KindBrowser",
     "kind_fetch",
     "fetch_investor_warning",
     "fetch_shortterm_overheat",
     "fetch_market_watch",
     "fetch_delist",
+    "close_browser",
 ]
 
 # ─────────────────────────────────────────────────────────────
-# 상수
+# 상수 (원본 fnc2.py와 동일)
 # ─────────────────────────────────────────────────────────────
+BASE = "https://kind.krx.co.kr"
+KIND_URL = f"{BASE}/disclosure/details.do"
+
 VIEWER_BASE = (
     "https://kind.krx.co.kr/common/disclsviewer.do?"
     "method=search&acptno={docno}&docno=&viewerhost=&viewerport="
 )
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-)
 
-# 카테고리 코드 (세부검색 disTypevalue)
 CODE_MAP: Dict[str, str] = {
     "halt":  "0311",  # 거래정지/재개
     "mgmt":  "0350",  # 관리종목
@@ -39,13 +60,135 @@ CODE_MAP: Dict[str, str] = {
     "misc":  "0305",  # 기타 시장안내
 }
 
-KIND_URL = "https://kind.krx.co.kr/disclosure/details.do"
+# ─────────────────────────────────────────────────────────────
+# Selenium 브라우저 래퍼
+# ─────────────────────────────────────────────────────────────
+class KindBrowser:
+    """
+    KIND용 Chrome 세션 관리자.
+    - warm(): 상세검색 페이지를 실제로 로드해 세션 확보
+    - post_search(payload): 브라우저 내부 fetch로 searchDetailsSub POST 실행
+    """
+
+    def __init__(self, headless: bool = True, page_load_timeout: int = 60):
+        opts = Options()
+        if headless:
+            opts.add_argument("--headless=new")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--window-size=1400,900")
+        opts.add_argument("--lang=ko-KR")
+        # 자동화 흔적 최소화
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+
+        self.driver = webdriver.Chrome(options=opts)
+        self.driver.set_page_load_timeout(page_load_timeout)
+        self.driver.set_script_timeout(page_load_timeout)
+
+        # navigator.webdriver 숨기기
+        try:
+            self.driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluatedOnNewDocument",
+                {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"},
+            )
+        except Exception:
+            pass
+
+        self._warmed_key: Optional[str] = None
+
+    # -- 세션 확보 ------------------------------------------------
+    def warm(self, dis_type_value: str = "") -> None:
+        """상세검색 페이지 실제 로드 (카테고리별로 한 번씩만)."""
+        key = dis_type_value or "_main"
+        if self._warmed_key == key:
+            return
+        if dis_type_value:
+            url = f"{KIND_URL}?method=searchDetailsMain&disclosureType=02&disTypevalue={dis_type_value}"
+        else:
+            url = f"{KIND_URL}?method=searchDetailsMain"
+        self.driver.get(url)
+        time.sleep(1.0)  # 페이지 초기 스크립트 실행 대기
+        self._warmed_key = key
+
+    # -- 브라우저 내부 fetch로 POST ---------------------------------
+    _FETCH_JS = """
+        const payload = arguments[0];
+        const done = arguments[arguments.length - 1];
+        const body = new URLSearchParams();
+        for (const [k, v] of Object.entries(payload)) body.append(k, v);
+        fetch('/disclosure/details.do', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            body: body.toString(),
+            credentials: 'include'
+        })
+        .then(r => r.text())
+        .then(t => done({ok: true, html: t}))
+        .catch(e => done({ok: false, error: String(e)}));
+    """
+
+    def post_search(self, payload: Dict[str, str], *, retries: int = 3, backoff: float = 5.0) -> str:
+        """searchDetailsSub POST → HTML. 차단 감지 시 페이지 재로드 후 재시도."""
+        last_err = ""
+        for attempt in range(1, retries + 1):
+            try:
+                res = self.driver.execute_async_script(self._FETCH_JS, payload)
+            except WebDriverException as e:
+                res = {"ok": False, "error": f"webdriver: {e}"}
+
+            if res.get("ok"):
+                html = res.get("html", "")
+                if _looks_like_valid_kind_table(html):
+                    return html
+                last_err = "응답이 정상 테이블이 아님(차단/빈응답 가능): " + re.sub(r"\s+", " ", html)[:200]
+            else:
+                last_err = res.get("error", "unknown fetch error")
+
+            # 재시도 전: 세션 리프레시
+            if attempt < retries:
+                time.sleep(backoff * attempt)
+                self._warmed_key = None
+                self.warm(payload.get("disclosureTypeArr02", ""))
+
+        raise RuntimeError(f"KIND(Selenium) 요청 실패 ({retries}회 시도): {last_err}")
+
+    def close(self):
+        try:
+            self.driver.quit()
+        except Exception:
+            pass
+
+
+# 모듈 전역 브라우저 (원본의 requests.Session 역할)
+_browser: Optional[KindBrowser] = None
+
+
+def _get_browser(headless: bool = True) -> KindBrowser:
+    global _browser
+    if _browser is None:
+        _browser = KindBrowser(headless=headless)
+        atexit.register(close_browser)
+    return _browser
+
+
+def close_browser():
+    """전역 브라우저 종료 (노트북 마지막 셀에서 호출 권장)."""
+    global _browser
+    if _browser is not None:
+        _browser.close()
+        _browser = None
+
 
 # ─────────────────────────────────────────────────────────────
-# 유틸
+# 유틸 (원본 fnc2.py와 동일)
 # ─────────────────────────────────────────────────────────────
-def _date_to_str(d: str | pd.Timestamp) -> str:
-    """'YYYY-MM-DD' 또는 'YYYYMMDD' 또는 pandas.Timestamp → 'YYYY-MM-DD'"""
+def _date_to_str(d) -> str:
     if isinstance(d, pd.Timestamp):
         return d.strftime("%Y-%m-%d")
     s = str(d)
@@ -55,9 +198,6 @@ def _date_to_str(d: str | pd.Timestamp) -> str:
 
 
 def _extract_company_cell(company_td) -> Tuple[str, List[str], str, str]:
-    """
-    회사명 셀에서 시장/플래그/회사명/종목코드 추출
-    """
     market = ""
     flags: List[str] = []
 
@@ -80,7 +220,7 @@ def _extract_company_cell(company_td) -> Tuple[str, List[str], str, str]:
 
     code_num = ""
     if comp_a and comp_a.has_attr("onclick"):
-        m = re.search(r"companysummary_open\('(\d+)'\)", comp_a["onclick"])
+        m = re.search(r"companysummary_open\('(\w+)'\)", comp_a["onclick"])
         if m:
             code_num = m.group(1)
 
@@ -88,10 +228,6 @@ def _extract_company_cell(company_td) -> Tuple[str, List[str], str, str]:
 
 
 def _parse_rows_html(html: str) -> List[List[str]]:
-    """
-    상세검색 테이블 파싱 → 행 배열
-    반환: [번호, 시간, 시장, 플래그, 회사명, 종목코드, 공시제목, 문서번호, 뷰어URL, 제출인]
-    """
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table", class_="list type-00 mt10")
     if not table or not table.tbody:
@@ -106,8 +242,7 @@ def _parse_rows_html(html: str) -> List[List[str]]:
         no = tds[0].get_text(strip=True)
         ts = tds[1].get_text(strip=True)
 
-        company_td = tds[2]
-        market, flags, company_name, code_num = _extract_company_cell(company_td)
+        market, flags, company_name, code_num = _extract_company_cell(tds[2])
 
         title_td = tds[3]
         a = title_td.find("a", onclick=True)
@@ -131,176 +266,27 @@ def _parse_rows_html(html: str) -> List[List[str]]:
 
 
 def _make_df(rows: List[List[str]]) -> pd.DataFrame:
-    """rows → DF, 문서번호 중복 제거 + 시간 내림차순 + 스팩 제외"""
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(
         rows,
         columns=["번호","시간","시장","플래그","회사명","종목코드","공시제목","문서번호","뷰어URL","제출인"]
     )
-    if "문서번호" in df.columns:
-        df = df.drop_duplicates(subset=["문서번호"], keep="first")
-    if "시간" in df.columns:
-        df["__ts"] = pd.to_datetime(df["시간"], errors="coerce")
-        df = df.sort_values("__ts", ascending=False).drop(columns="__ts")
-    if "회사명" in df.columns:
-        df["회사명"] = df["회사명"].astype(str)
-        df = df[~df["회사명"].str.contains("스팩", na=False)]
+    df = df.drop_duplicates(subset=["문서번호"], keep="first")
+    df["__ts"] = pd.to_datetime(df["시간"], errors="coerce")
+    df = df.sort_values("__ts", ascending=False).drop(columns="__ts")
+    df["회사명"] = df["회사명"].astype(str)
+    df = df[~df["회사명"].str.contains("스팩", na=False)]
     return df.reset_index(drop=True)
 
 
 def _looks_like_valid_kind_table(html: str) -> bool:
-    # 정상 응답이면 보통 아래 테이블이 존재
     return ('table class="list type-00 mt10"' in html) or ("list type-00 mt10" in html)
 
 
 # ─────────────────────────────────────────────────────────────
-# 공통 상세검색 (카테고리 1~4/6)
+# 페이로드 (원본 fnc2.py와 동일)
 # ─────────────────────────────────────────────────────────────
-def _kind_disclosure_search(
-    from_date: str,
-    to_date: str,
-    code: str,
-    *,
-    page_size: int = 100,
-    max_pages: int = 1000,
-    sleep: float = 5,
-    timeout: int = 300,
-    verify_ssl: bool = False,
-    session: Optional[requests.Session] = None,
-    report_nm: Optional[str] = None,
-    report_cd: Optional[str] = None,
-) -> pd.DataFrame:
-    """
-    KIND 상세검색(카테고리) 페이지네이션 수집.
-    반환 컬럼:
-    [페이지, 번호, 시간, 시장, 플래그, 회사명, 종목코드, 공시제목, 문서번호, 뷰어URL, 제출인]
-    """
-    BASE = "https://kind.krx.co.kr"
-    GET_URL = f"{BASE}/disclosure/details.do"
-    POST_URL = f"{BASE}/disclosure/details.do"
-
-    f = _date_to_str(from_date)
-    t = _date_to_str(to_date)
-
-    base_headers = {"User-Agent": UA, "Accept": "text/html, */*; q=0.01"}
-    ajax_headers = {
-        **base_headers,
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "Origin": "https://kind.krx.co.kr",
-        "Referer": f"{GET_URL}?method=searchDetailsMain&disclosureType=02&disTypevalue={code}",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-
-    warm_params = {"method": "searchDetailsMain", "disclosureType": "02", "disTypevalue": code}
-
-    data = {
-        "method": "searchDetailsSub",
-        "currentPageSize": str(page_size),
-        "pageIndex": "1",
-        "orderMode": "1",
-        "orderStat": "D",
-        "forward": "details_sub",
-        "disclosureType02": f"{code}|",
-        "pDisclosureType02": f"{code}|",
-        "disclosureTypeArr02": code,
-        "fromDate": f,
-        "toDate": t,
-        "reportNm": report_nm or "",
-        "reportNmTemp": report_nm or "",
-        "reportNmPop": report_nm or "",
-        "reportCd": (str(report_cd) if report_cd is not None else ""),
-
-        # 나머지 공란(원형 유지)
-        "disclosureType01": "","disclosureType03": "","disclosureType04": "","disclosureType05": "",
-        "disclosureType06": "","disclosureType07": "","disclosureType08": "","disclosureType09": "",
-        "disclosureType10": "","disclosureType11": "","disclosureType13": "","disclosureType14": "",
-        "disclosureType20": "","pDisclosureType01": "","pDisclosureType03": "","pDisclosureType04": "",
-        "pDisclosureType05": "","pDisclosureType06": "","pDisclosureType07": "","pDisclosureType08": "",
-        "pDisclosureType09": "","pDisclosureType10": "","pDisclosureType11": "","pDisclosureType13": "",
-        "pDisclosureType14": "","pDisclosureType20": "","searchCodeType": "","repIsuSrtCd": "",
-        "allRepIsuSrtCd": "","oldSearchCorpName": "","searchCorpName": "",
-        "business": "","marketType": "","settlementMonth": "","securities": "","submitOblgNm": "",
-        "enterprise": "",
-    }
-
-    cols = ["페이지","번호","시간","시장","플래그","회사명","종목코드","공시제목","문서번호","뷰어URL","제출인"]
-    rows: List[List[str]] = []
-
-    close_after = False
-    s = session
-    if s is None:
-        s = requests.Session()
-        close_after = True
-
-    try:
-        s.headers.update(base_headers)
-        s.get(GET_URL, params=warm_params, timeout=timeout, verify=False)
-
-        for page in range(1, max_pages + 1):
-            data["pageIndex"] = str(page)
-            r = s.post(POST_URL, data=data, headers=ajax_headers, timeout=timeout, verify=False)
-            r.raise_for_status()
-            r.encoding = r.apparent_encoding
-            html = r.text
-
-            # ✅ 200 OK 차단/오류 HTML도 여기서 걸러서 "캐싱"을 방지
-            if not _looks_like_valid_kind_table(html):
-                snippet = re.sub(r"\s+", " ", html)[:300]
-                raise RuntimeError(f"KIND 응답이 정상 테이블이 아님(차단/오류 가능). 응답 일부: {snippet}")
-
-            added = 0
-            for row in _parse_rows_html(html):
-                rows.append([page] + row)
-                added += 1
-
-            if added == 0 or added < int(page_size):
-                break
-            if sleep:
-                time.sleep(sleep)
-
-    finally:
-        if close_after:
-            s.close()
-
-    df = pd.DataFrame(rows, columns=cols)
-    if not df.empty and "회사명" in df.columns:
-        df["회사명"] = df["회사명"].astype(str)
-        df = df[~df["회사명"].str.contains("스팩", na=False)]
-    return df.reset_index(drop=True)
-
-
-def kind_fetch(
-    category: str,
-    from_date: str,
-    to_date: str,
-    page_size: int = 100,
-    max_pages: int = 1000,
-    *,
-    report_nm: Optional[str] = None,
-    report_cd: Optional[str] = None,
-) -> pd.DataFrame:
-    """cat 기반(기존): halt/mgmt/alert/misc"""
-    code = CODE_MAP[category]
-    df = _kind_disclosure_search(
-        from_date, to_date, code,
-        page_size=page_size, max_pages=max_pages,
-        report_nm=report_nm, report_cd=report_cd
-    )
-    return df.reset_index(drop=True) if df is not None and not df.empty else pd.DataFrame()
-
-
-# ─────────────────────────────────────────────────────────────
-# 투자경고·위험 / 단기과열 / 시장감시위원회 (warn 페이로드)
-# ─────────────────────────────────────────────────────────────
-HEADERS_MENU_WARN = {
-    "User-Agent": UA,
-    "Accept": "text/html, */*; q=0.01",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    "Origin": "https://kind.krx.co.kr",
-    "Referer": "https://kind.krx.co.kr/disclosure/details.do?method=searchDetailsMain",
-    "X-Requested-With": "XMLHttpRequest",
-}
 BASE_PAYLOAD_WARN = {
     "method":"searchDetailsSub","currentPageSize":"15","pageIndex":"1",
     "orderMode":"1","orderStat":"D","forward":"details_sub",
@@ -338,7 +324,6 @@ TARGETS_WARN: List[Tuple[str,str,str,str]] = [
     ("투자위험종목지정해제",     "70834", "투자위험종목지정해제",            "투자위험종목지정해제"),
 ]
 
-# ✅ "시장감시위원회" 메뉴에서 보여줄 reportCd 세트 (사용자 제공)
 TARGETS_MARKET_WATCH: List[Tuple[str,str,str,str]] = [
     # [유가증권]
     ("기타시장안내(단기과열완화장치발동예고)", "99432",
@@ -365,7 +350,6 @@ TARGETS_MARKET_WATCH: List[Tuple[str,str,str,str]] = [
      "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외종가매매 방식 재개)", "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외종가매매 방식 재개)"),
     ("장애종목매매거래재개시장안내(유가증권시장/시간외종가매매호가접수시간대재개)", "99460",
      "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외종가매매 호가접수시간대 재개)", "장애종목 매매거래재개 시장안내 (유가증권시장 / 시간외종가매매 호가접수시간대 재개)"),
-
     # [코스닥]
     ("기타시장안내(단기과열완화장치발동예고)", "70729",
      "기타시장안내 (단기과열완화장치 발동예고)", "기타시장안내 (단기과열완화장치 발동예고)"),
@@ -391,15 +375,110 @@ TARGETS_MARKET_WATCH: List[Tuple[str,str,str,str]] = [
      "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외종가매매 호가접수시간대 재개)", "장애종목 매매거래재개 시장안내 (코스닥시장 / 시간외종가매매 호가접수시간대 재개)"),
 ]
 
-# ─────────────────────────────────────────────────────────────
-# ✅ 상장폐지 reportCd 세트 (유가증권 68051 / 코스닥 70769)
-# ─────────────────────────────────────────────────────────────
 TARGETS_DELIST: List[Tuple[str,str,str,str]] = [
     ("상장폐지", "68051", "상장폐지", "상장폐지"),   # 유가증권
     ("상장폐지", "70769", "상장폐지", "상장폐지"),   # 코스닥
 ]
 
 
+# ─────────────────────────────────────────────────────────────
+# 공통 상세검색 (카테고리: halt/mgmt/alert/misc)
+# ─────────────────────────────────────────────────────────────
+def _kind_disclosure_search(
+    from_date: str,
+    to_date: str,
+    code: str,
+    *,
+    page_size: int = 100,
+    max_pages: int = 1000,
+    sleep: float = 2,
+    headless: bool = True,
+    report_nm: Optional[str] = None,
+    report_cd: Optional[str] = None,
+) -> pd.DataFrame:
+    f = _date_to_str(from_date)
+    t = _date_to_str(to_date)
+
+    data = {
+        "method": "searchDetailsSub",
+        "currentPageSize": str(page_size),
+        "pageIndex": "1",
+        "orderMode": "1",
+        "orderStat": "D",
+        "forward": "details_sub",
+        "disclosureType02": f"{code}|",
+        "pDisclosureType02": f"{code}|",
+        "disclosureTypeArr02": code,
+        "fromDate": f,
+        "toDate": t,
+        "reportNm": report_nm or "",
+        "reportNmTemp": report_nm or "",
+        "reportNmPop": report_nm or "",
+        "reportCd": (str(report_cd) if report_cd is not None else ""),
+        "disclosureType01": "","disclosureType03": "","disclosureType04": "","disclosureType05": "",
+        "disclosureType06": "","disclosureType07": "","disclosureType08": "","disclosureType09": "",
+        "disclosureType10": "","disclosureType11": "","disclosureType13": "","disclosureType14": "",
+        "disclosureType20": "","pDisclosureType01": "","pDisclosureType03": "","pDisclosureType04": "",
+        "pDisclosureType05": "","pDisclosureType06": "","pDisclosureType07": "","pDisclosureType08": "",
+        "pDisclosureType09": "","pDisclosureType10": "","pDisclosureType11": "","pDisclosureType13": "",
+        "pDisclosureType14": "","pDisclosureType20": "","searchCodeType": "","repIsuSrtCd": "",
+        "allRepIsuSrtCd": "","oldSearchCorpName": "","searchCorpName": "",
+        "business": "","marketType": "","settlementMonth": "","securities": "","submitOblgNm": "",
+        "enterprise": "",
+    }
+
+    cols = ["페이지","번호","시간","시장","플래그","회사명","종목코드","공시제목","문서번호","뷰어URL","제출인"]
+    rows: List[List[str]] = []
+
+    br = _get_browser(headless=headless)
+    br.warm(code)
+
+    for page in range(1, max_pages + 1):
+        data["pageIndex"] = str(page)
+        html = br.post_search(data)
+
+        added = 0
+        for row in _parse_rows_html(html):
+            rows.append([page] + row)
+            added += 1
+
+        if added == 0 or added < int(page_size):
+            break
+        if sleep:
+            time.sleep(sleep)
+
+    df = pd.DataFrame(rows, columns=cols)
+    if not df.empty:
+        df["회사명"] = df["회사명"].astype(str)
+        df = df[~df["회사명"].str.contains("스팩", na=False)]
+    return df.reset_index(drop=True)
+
+
+def kind_fetch(
+    category: str,
+    from_date: str,
+    to_date: str,
+    page_size: int = 100,
+    max_pages: int = 1000,
+    *,
+    report_nm: Optional[str] = None,
+    report_cd: Optional[str] = None,
+    headless: bool = True,
+) -> pd.DataFrame:
+    """cat 기반: halt/mgmt/alert/misc (원본과 동일 시그니처 + headless 옵션)"""
+    code = CODE_MAP[category]
+    df = _kind_disclosure_search(
+        from_date, to_date, code,
+        page_size=page_size, max_pages=max_pages,
+        report_nm=report_nm, report_cd=report_cd,
+        headless=headless,
+    )
+    return df.reset_index(drop=True) if df is not None and not df.empty else pd.DataFrame()
+
+
+# ─────────────────────────────────────────────────────────────
+# 투자경고·위험 / 단기과열 / 시장감시위원회 / 상장폐지
+# ─────────────────────────────────────────────────────────────
 def _fetch_reportcd_with_warn_payload(
     from_date: str,
     to_date: str,
@@ -407,80 +486,17 @@ def _fetch_reportcd_with_warn_payload(
     *,
     page_size: int = 100,
     max_pages: int = 1000,
-    sleep: float = 5,
+    sleep: float = 2,
+    headless: bool = True,
 ) -> pd.DataFrame:
     f = _date_to_str(from_date)
     t = _date_to_str(to_date)
 
     rows: List[List[str]] = []
-    with requests.Session() as s:
-        s.headers.update(HEADERS_MENU_WARN)
+    br = _get_browser(headless=headless)
+    br.warm("")  # searchDetailsMain 기본 페이지
 
-        for nm, cd, nm_temp, nm_pop in targets:
-            for page in range(1, max_pages + 1):
-                payload = {
-                    **BASE_PAYLOAD_WARN,
-                    "currentPageSize": str(page_size),
-                    "pageIndex": str(page),
-                    "fromDate": f,
-                    "toDate": t,
-                    "reportNm": nm,
-                    "reportCd": cd,
-                    "reportNmTemp": nm_temp,
-                    "reportNmPop": nm_pop,
-                }
-                r = s.post(KIND_URL, data=payload, timeout=300, verify=False)
-                r.raise_for_status()
-                html = r.text
-
-                # ✅ 200 OK 차단/오류 HTML도 여기서 걸러서 "캐싱"을 방지
-                if not _looks_like_valid_kind_table(html):
-                    snippet = re.sub(r"\s+", " ", html)[:300]
-                    raise RuntimeError(f"KIND(warn payload) 응답이 정상 테이블이 아님(차단/오류 가능). 응답 일부: {snippet}")
-
-                before = len(rows)
-                rows += _parse_rows_html(html)
-                added = len(rows) - before
-
-                if added == 0 or added < int(page_size):
-                    break
-                if sleep:
-                    time.sleep(sleep)
-
-    return _make_df(rows)
-
-
-def fetch_investor_warning(
-    from_date: str,
-    to_date: str,
-    *,
-    page_size: int = 100,
-    max_pages: int = 1000,
-    sleep: float = 5,
-) -> pd.DataFrame:
-    """투자경고·위험: 여러 reportCd × 페이지네이션 전체 수집 → 문서번호 중복 제거."""
-    return _fetch_reportcd_with_warn_payload(
-        from_date, to_date, TARGETS_WARN,
-        page_size=page_size, max_pages=max_pages, sleep=sleep
-    )
-
-
-def fetch_shortterm_overheat(
-    from_date: str,
-    to_date: str,
-    *,
-    page_size: int = 100,
-    max_pages: int = 1000,
-    sleep: float = 5,
-) -> pd.DataFrame:
-    """단기과열: reportNm='단기과열' 단일 조건 페이지네이션 수집."""
-    f = _date_to_str(from_date)
-    t = _date_to_str(to_date)
-
-    rows: List[List[str]] = []
-    with requests.Session() as s:
-        s.headers.update(HEADERS_MENU_WARN)
-
+    for nm, cd, nm_temp, nm_pop in targets:
         for page in range(1, max_pages + 1):
             payload = {
                 **BASE_PAYLOAD_WARN,
@@ -488,18 +504,12 @@ def fetch_shortterm_overheat(
                 "pageIndex": str(page),
                 "fromDate": f,
                 "toDate": t,
-                "reportNm": "단기과열",
-                "reportCd": "",
-                "reportNmTemp": "단기과열",
-                "reportNmPop": "",
+                "reportNm": nm,
+                "reportCd": cd,
+                "reportNmTemp": nm_temp,
+                "reportNmPop": nm_pop,
             }
-            r = s.post(KIND_URL, data=payload, timeout=300, verify=False)
-            r.raise_for_status()
-            html = r.text
-
-            if not _looks_like_valid_kind_table(html):
-                snippet = re.sub(r"\s+", " ", html)[:300]
-                raise RuntimeError(f"KIND(단기과열) 응답이 정상 테이블이 아님(차단/오류 가능). 응답 일부: {snippet}")
+            html = br.post_search(payload)
 
             before = len(rows)
             rows += _parse_rows_html(html)
@@ -513,31 +523,75 @@ def fetch_shortterm_overheat(
     return _make_df(rows)
 
 
-def fetch_market_watch(
-    from_date: str,
-    to_date: str,
-    *,
-    page_size: int = 100,
-    max_pages: int = 1000,
-    sleep: float = 5,
-) -> pd.DataFrame:
-    """시장감시위원회(사용자 지정): 사용자가 준 reportCd 목록을 warn 페이로드 방식으로 조회."""
+def fetch_investor_warning(from_date, to_date, *, page_size=100, max_pages=1000, sleep=2, headless=True) -> pd.DataFrame:
+    """투자경고·위험: 여러 reportCd × 페이지네이션 전체 수집 → 문서번호 중복 제거."""
+    return _fetch_reportcd_with_warn_payload(
+        from_date, to_date, TARGETS_WARN,
+        page_size=page_size, max_pages=max_pages, sleep=sleep, headless=headless,
+    )
+
+
+def fetch_shortterm_overheat(from_date, to_date, *, page_size=100, max_pages=1000, sleep=2, headless=True) -> pd.DataFrame:
+    """단기과열: reportNm='단기과열' 단일 조건 페이지네이션 수집."""
+    f = _date_to_str(from_date)
+    t = _date_to_str(to_date)
+
+    rows: List[List[str]] = []
+    br = _get_browser(headless=headless)
+    br.warm("")
+
+    for page in range(1, max_pages + 1):
+        payload = {
+            **BASE_PAYLOAD_WARN,
+            "currentPageSize": str(page_size),
+            "pageIndex": str(page),
+            "fromDate": f,
+            "toDate": t,
+            "reportNm": "단기과열",
+            "reportCd": "",
+            "reportNmTemp": "단기과열",
+            "reportNmPop": "",
+        }
+        html = br.post_search(payload)
+
+        before = len(rows)
+        rows += _parse_rows_html(html)
+        added = len(rows) - before
+
+        if added == 0 or added < int(page_size):
+            break
+        if sleep:
+            time.sleep(sleep)
+
+    return _make_df(rows)
+
+
+def fetch_market_watch(from_date, to_date, *, page_size=100, max_pages=1000, sleep=2, headless=True) -> pd.DataFrame:
+    """시장감시위원회: 지정 reportCd 목록 조회."""
     return _fetch_reportcd_with_warn_payload(
         from_date, to_date, TARGETS_MARKET_WATCH,
-        page_size=page_size, max_pages=max_pages, sleep=sleep
+        page_size=page_size, max_pages=max_pages, sleep=sleep, headless=headless,
     )
 
 
-def fetch_delist(
-    from_date: str,
-    to_date: str,
-    *,
-    page_size: int = 100,
-    max_pages: int = 1000,
-    sleep: float = 5,
-) -> pd.DataFrame:
-    """상장폐지: 유가증권(68051) + 코스닥(70769) reportCd를 warn 페이로드 방식으로 조회."""
+def fetch_delist(from_date, to_date, *, page_size=100, max_pages=1000, sleep=2, headless=True) -> pd.DataFrame:
+    """상장폐지: 유가증권(68051) + 코스닥(70769)."""
     return _fetch_reportcd_with_warn_payload(
         from_date, to_date, TARGETS_DELIST,
-        page_size=page_size, max_pages=max_pages, sleep=sleep
+        page_size=page_size, max_pages=max_pages, sleep=sleep, headless=headless,
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# 단독 실행 테스트
+# ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import datetime as dt
+    today = dt.date.today()
+    week_ago = today - dt.timedelta(days=7)
+    try:
+        df = fetch_delist(str(week_ago), str(today), headless=True)
+        print(f"상장폐지 공시 {len(df)}건")
+        print(df.head(10).to_string())
+    finally:
+        close_browser()
